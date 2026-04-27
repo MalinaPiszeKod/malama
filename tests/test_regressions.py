@@ -127,6 +127,8 @@ class CommandBuilderRegressionTests(unittest.TestCase):
 
         self.assertEqual(args["model"], "D:/models/demo.gguf")
         self.assertEqual(args["flash-attn"], "on")
+        self.assertEqual(args["n-cpu-moe"], 28)
+        self.assertNotIn("cpu-moe", args)
         self.assertEqual(args["reasoning-format"], "none")
         self.assertTrue(args["mlock"])
         self.assertTrue(args["no-mmap"])
@@ -149,6 +151,15 @@ class CommandBuilderRegressionTests(unittest.TestCase):
         args = build_command_args("D:/models/demo.gguf", settings)
 
         self.assertEqual(args["flash-attn"], "off")
+
+    def test_build_command_args_omits_moe_flags_when_disabled(self) -> None:
+        settings = dict(DEFAULT_SETTINGS)
+        settings["NcpuMoe"] = 0
+
+        args = build_command_args("D:/models/demo.gguf", settings)
+
+        self.assertNotIn("n-cpu-moe", args)
+        self.assertNotIn("cpu-moe", args)
 
 
 if __name__ == "__main__":

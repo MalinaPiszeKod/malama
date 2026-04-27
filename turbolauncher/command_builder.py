@@ -18,7 +18,6 @@ def build_command_args(
     args["n-gpu-layers"] = s["GpuLayers"]
     if s["NcpuMoe"] > 0:
         args["n-cpu-moe"] = s["NcpuMoe"]
-        args["cpu-moe"] = True
     args["ctx-size"] = s["CtxSize"]
     args["batch-size"] = s["BatchSize"]
     args["ubatch-size"] = s["UBatchSize"]

@@ -51,8 +51,10 @@ def run_headless_tests(runtime_path: str | None = None) -> int:
 
     if args.get("reasoning-format") == "none" and settings.get("Thinking"):
         failures.append("Thinking preset unexpectedly disables reasoning")
-    if settings["NcpuMoe"] > 0 and "cpu-moe" not in args:
-        failures.append("CPU MoE flag missing")
+    if settings["NcpuMoe"] > 0 and "n-cpu-moe" not in args:
+        failures.append("CPU MoE layer count flag missing")
+    if settings["NcpuMoe"] > 0 and "cpu-moe" in args:
+        failures.append("Redundant CPU MoE full-offload flag present")
 
     cmd = command_string(core.resolve_runtime_executable() or "llama-server.exe", args)
     if "--model" not in cmd:
