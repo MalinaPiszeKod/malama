@@ -42,6 +42,26 @@ def read_cfg(path: Path) -> dict[str, str]:
     return cfg
 
 
+def parse_cfg_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value.strip())
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def parse_cfg_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"on", "true", "1"}:
+        return True
+    if normalized in {"off", "false", "0"}:
+        return False
+    return None
+
+
 @dataclass(frozen=True)
 class ModelEntry:
     path: Path
@@ -49,6 +69,12 @@ class ModelEntry:
     size_gb: float
     alias: str
     directory: str
+    sys_prompt: str = ""
+    chat_template: str = ""
+    config_path: Path | None = None
+    transformer_layers: int | None = None
+    output_layer: bool | None = None
+    full_offload_layers: int | None = None
 
     @property
     def quant(self) -> str:

@@ -5,11 +5,12 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from .command_backends import apply_backend_command_rules
 from .settings import normalize_settings, validate_launch_settings
 
 
 def build_command_args(
-    model_path: str | Path, settings: dict[str, Any]
+    model_path: str | Path, settings: dict[str, Any], *, backend: str = "default"
 ) -> OrderedDict[str, Any]:
     s = normalize_settings(settings, strict=True)
     validate_launch_settings(s)
@@ -81,6 +82,7 @@ def build_command_args(
         args["metrics"] = True
     if s["ContBatching"]:
         args["cont-batching"] = True
+    apply_backend_command_rules(args, s, backend=backend)
     return args
 
 

@@ -1,0 +1,5 @@
+# Model registry - alias=config_path
+# No spaces around =
+
+qwen36=model-configs\qwen36.cfg
+Gemma_3_1B_IT=C:\Users\slipp\.cache\huggingface\hf_download\lmstudio-community__gemma-3-1b-it-GGUF\gemma-3-1b-it-Q3_K_L.gguf

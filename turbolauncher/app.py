@@ -27,15 +27,11 @@ from typing import Any, Iterable
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from .chat import ChatAPIError, ChatMessage, get_model_id, stream_chat_events
 from .command_builder import args_to_list, build_command_args, command_string
 from .core import LauncherCore, sanitize_alias
 from .models import ModelEntry, detect_quant
-from .monitoring import (
-    get_cpu_usage,
-    get_gpu_info,
-    get_ram_usage,
-    parse_prometheus_metrics as _parse_prometheus_metrics,
-)
+from .monitoring import parse_prometheus_metrics as _parse_prometheus_metrics
 from .paths import (
     APP_DIR,
     APP_NAME,
@@ -51,6 +47,8 @@ from .paths import (
     SESSION_FILE,
     ensure_dirs,
 )
+from .services.launcher_service import LaunchRequest, LauncherService, RunningProcess
+from .services.monitoring_service import MonitoringService
 from .settings import (
     BUILT_IN_PRESETS,
     CACHE_TYPES,
@@ -66,31 +64,91 @@ from .settings import (
 from .vram import calculate_total_vram, get_kv_cache_size_gb, get_model_size_gb
 
 
+APP_TITLE = "Malina's Llama Launcher"
+
+
 def parse_prometheus_metrics(content: str) -> dict[str, Any]:
     return _parse_prometheus_metrics(content)
 
 
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, parent: tk.Misc, *, style: str = "TFrame") -> None:
+        super().__init__(parent, style=style)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(
+            self,
+            bg=TurboLauncherApp.COLORS["bg"],
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.content = ttk.Frame(self.canvas, style=style)
+        self.content.columnconfigure(0, weight=1)
+        self._window = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.bind(
+            "<Configure>",
+            lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
+        )
+        self.canvas.bind(
+            "<Configure>",
+            lambda e: self.canvas.itemconfigure(self._window, width=e.width),
+        )
+        self.canvas.bind("<Enter>", self._bind_mousewheel)
+        self.canvas.bind("<Leave>", self._unbind_mousewheel)
+        self.content.bind("<Enter>", self._bind_mousewheel)
+        self.content.bind("<Leave>", self._unbind_mousewheel)
+
+    def _bind_mousewheel(self, _event: tk.Event) -> None:
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
+
+    def _unbind_mousewheel(self, _event: tk.Event) -> None:
+        self.canvas.unbind_all("<MouseWheel>")
+        self.canvas.unbind_all("<Button-4>")
+        self.canvas.unbind_all("<Button-5>")
+
+    def _on_mousewheel(self, event: tk.Event) -> str:
+        if hasattr(event, "delta") and event.delta:
+            step = -1 * int(event.delta / 120) if event.delta else 0
+        else:
+            num = getattr(event, "num", 0)
+            step = -1 if num == 4 else (1 if num == 5 else 0)
+        if step:
+            self.canvas.yview_scroll(step, "units")
+        return "break"
+
+
 class TurboLauncherApp(tk.Tk):
     COLORS = {
-        "bg": "#0f172a",
+        "bg": "#0b1020",
         "panel": "#111827",
-        "panel2": "#1f2937",
-        "surface": "#020617",
+        "panel2": "#162033",
+        "surface": "#0f172a",
+        "surface2": "#0b1220",
         "text": "#e5e7eb",
         "muted": "#9ca3af",
-        "accent": "#38bdf8",
+        "accent": "#60a5fa",
+        "accent2": "#38bdf8",
         "green": "#34d399",
         "orange": "#fb923c",
         "red": "#f87171",
+        "line": "#243041",
     }
 
-    BODY_FONT = ("Aptos", 10)
-    TITLE_FONT = ("Aptos Display", 21)
-    SECTION_FONT = ("Aptos", 11)
+    BODY_FONT = ("Segoe UI", 10)
+    TITLE_FONT = ("Bahnschrift SemiBold", 18)
+    SECTION_FONT = ("Segoe UI Semibold", 10)
 
     def __init__(self, runtime_path: str | None = None) -> None:
         super().__init__()
         self.core = LauncherCore(runtime_path)
+        self.launcher_service = LauncherService()
+        self.monitoring_service = MonitoringService()
         self.models: list[ModelEntry] = []
         self.presets: list[dict[str, Any]] = []
         self.selected_model: ModelEntry | None = None
@@ -101,6 +159,7 @@ class TurboLauncherApp(tk.Tk):
         self.available_vram = 16.0
         self.total_layers = 40
         self.process: subprocess.Popen[str] | None = None
+        self.running_process: RunningProcess | None = None
         self.server_start_time: float | None = None
         self.running_host: str | None = None
         self.running_port: int | None = None
@@ -111,10 +170,28 @@ class TurboLauncherApp(tk.Tk):
         self.model_context_vars: dict[str, tk.StringVar] = {}
         self.model_context_notes: tk.StringVar | None = None
         self.launch_model_var: tk.StringVar | None = None
+        self.chat_state_file = SESSION_DIR / "chat_state.json"
+        self.chat_state: dict[str, Any] = {"models": {}}
+        self.chat_history: list[ChatMessage] = []
+        self.chat_settings_visible = False
+        self.chat_request_in_flight = False
+        self.chat_status_var = tk.StringVar(value="Idle")
+        self.chat_model_id_var = tk.StringVar(value="--")
+        self.chat_endpoint_var = tk.StringVar(value="--")
+        self.chat_template_note_var = tk.StringVar(
+            value="Template changes apply on next server start."
+        )
+        self.command_preview_text: tk.Text | None = None
+        self.warning_text: tk.Text | None = None
+        self.logo_image: tk.PhotoImage | None = None
+        self.header_logo_image: tk.PhotoImage | None = None
+        self.gpu_layers_scale: ttk.Scale | None = None
+        self.full_offload_button: ttk.Button | None = None
+        self.gpu_offload_help_var = tk.StringVar(value="GPU layer count passed to llama.cpp.")
 
-        self.title("TurboLauncher")
+        self.title(APP_TITLE)
         self.geometry("1280x860")
-        self.minsize(1040, 720)
+        self.minsize(1180, 720)
         self.configure(bg=self.COLORS["bg"])
 
         self.vars: dict[str, tk.Variable] = {}
@@ -122,6 +199,7 @@ class TurboLauncherApp(tk.Tk):
         self._configure_style()
         self._create_variables()
         self._build_ui()
+        self.set_status("Stopped", "muted")
         self._wire_events()
         self._initialize_data()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -135,16 +213,24 @@ class TurboLauncherApp(tk.Tk):
             pass
         c = self.COLORS
         style.configure("TFrame", background=c["bg"])
+        style.configure("TopBar.TFrame", background=c["surface"])
         style.configure("Panel.TFrame", background=c["panel"])
-        style.configure("Surface.TFrame", background=c["surface"])
+        style.configure("Surface.TFrame", background=c["surface2"])
         style.configure(
             "TLabel", background=c["bg"], foreground=c["text"], font=self.BODY_FONT
         )
         style.configure("Muted.TLabel", background=c["bg"], foreground=c["muted"])
+        style.configure("TopBar.TLabel", background=c["surface"], foreground=c["text"])
         style.configure("Panel.TLabel", background=c["panel"], foreground=c["text"])
         style.configure(
             "Title.TLabel",
             background=c["bg"],
+            foreground=c["text"],
+            font=self.TITLE_FONT,
+        )
+        style.configure(
+            "TopTitle.TLabel",
+            background=c["surface"],
             foreground=c["text"],
             font=self.TITLE_FONT,
         )
@@ -155,32 +241,81 @@ class TurboLauncherApp(tk.Tk):
             font=self.SECTION_FONT,
         )
         style.configure(
+            "Pill.TLabel",
+            background=c["surface2"],
+            foreground=c["text"],
+            font=("Segoe UI Semibold", 9),
+            padding=(10, 4),
+        )
+        style.configure(
+            "Status.TLabel",
+            background=c["surface"],
+            foreground=c["text"],
+            font=("Segoe UI Semibold", 15),
+        )
+        style.configure(
+            "StatusCard.TLabel",
+            background=c["panel"],
+            foreground=c["text"],
+            font=("Segoe UI Semibold", 15),
+        )
+        style.configure(
             "Accent.TButton",
             background=c["accent"],
-            foreground="#001018",
+            foreground="#08111f",
             font=("Segoe UI Semibold", 10),
-            padding=8,
+            padding=(12, 8),
         )
         style.configure(
-            "Danger.TButton", background="#7f1d1d", foreground=c["text"], padding=8
+            "Danger.TButton",
+            background="#7f1d1d",
+            foreground=c["text"],
+            padding=(12, 8),
         )
         style.configure(
-            "TButton", background=c["panel2"], foreground=c["text"], padding=6
+            "TButton",
+            background=c["panel2"],
+            foreground=c["text"],
+            padding=(10, 7),
         )
-        style.map("TButton", background=[("active", "#334155")])
+        style.map(
+            "TButton",
+            background=[("active", c["surface2"]), ("pressed", c["surface"])],
+            foreground=[("disabled", c["muted"])],
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("active", c["accent2"]), ("pressed", c["accent"])],
+            foreground=[("disabled", "#0f172a")],
+        )
         style.configure(
             "TEntry",
-            fieldbackground="#0b1220",
+            fieldbackground=c["surface2"],
             foreground=c["text"],
             insertcolor=c["text"],
-            bordercolor="#334155",
+            bordercolor=c["line"],
+            relief="flat",
         )
         style.configure(
             "TCombobox",
-            fieldbackground="#0b1220",
+            fieldbackground=c["surface2"],
             foreground=c["text"],
             arrowcolor=c["text"],
-            bordercolor="#334155",
+            bordercolor=c["line"],
+            lightcolor=c["line"],
+            darkcolor=c["line"],
+            padding=4,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[
+                ("readonly", c["surface2"]),
+                ("active", c["surface2"]),
+                ("focus", c["surface2"]),
+            ],
+            foreground=[("readonly", c["text"]), ("disabled", c["muted"])],
+            selectbackground=[("readonly", c["accent"])],
+            selectforeground=[("readonly", "#08111f")],
         )
         style.configure("TNotebook", background=c["bg"], borderwidth=0)
         style.configure(
@@ -191,10 +326,12 @@ class TurboLauncherApp(tk.Tk):
         )
         style.map(
             "TNotebook.Tab",
-            background=[("selected", c["panel"])],
-            foreground=[("selected", c["text"])],
+            background=[("selected", c["panel"]), ("active", c["surface2"])],
+            foreground=[("selected", c["text"]), ("active", c["text"])],
         )
-        style.configure("TCheckbutton", background=c["bg"], foreground=c["text"])
+        style.configure(
+            "TCheckbutton", background=c["bg"], foreground=c["text"], padding=2
+        )
         style.configure(
             "Panel.TCheckbutton", background=c["panel"], foreground=c["text"]
         )
@@ -204,6 +341,12 @@ class TurboLauncherApp(tk.Tk):
         style.configure(
             "CardMuted.TLabel", background=c["panel"], foreground=c["muted"]
         )
+        style.configure("Transparent.TFrame", background=c["surface"], relief="flat")
+        self.option_add("*TCombobox*Listbox.background", c["surface2"])
+        self.option_add("*TCombobox*Listbox.foreground", c["text"])
+        self.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
+        self.option_add("*TCombobox*Listbox.selectForeground", "#08111f")
+        self.option_add("*TCombobox*Listbox.font", self.BODY_FONT)
 
     def _create_variables(self) -> None:
         for key, default in DEFAULT_SETTINGS.items():
@@ -229,7 +372,16 @@ class TurboLauncherApp(tk.Tk):
             "prompt_time",
             "kv_cache",
             "requests",
+            "requests_active",
+            "requests_queued",
             "tokens",
+            "prompt_tokens",
+            "session_slot",
+            "session_progress",
+            "prompt_progress",
+            "prompt_processed",
+            "session_decoded",
+            "session_remaining",
             "cpu",
             "ram",
             "gpu",
@@ -244,175 +396,110 @@ class TurboLauncherApp(tk.Tk):
     def _build_ui(self) -> None:
         root = ttk.Frame(self, style="TFrame")
         root.pack(fill="both", expand=True, padx=12, pady=12)
-        root.columnconfigure(1, weight=1)
-        root.rowconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+        root.columnconfigure(0, weight=1)
 
-        self._build_sidebar(root)
-        self._build_content(root)
+        self._build_top_bar(root)
 
-    def _build_sidebar(self, parent: ttk.Frame) -> None:
-        sidebar = ttk.Frame(parent, style="Panel.TFrame", width=292)
-        sidebar.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        sidebar.grid_propagate(False)
-        sidebar.columnconfigure(0, weight=1)
-        sidebar.rowconfigure(2, weight=0)
-        sidebar.rowconfigure(4, weight=1)
-        sidebar.rowconfigure(6, weight=0)
+        body = ttk.Frame(root, style="TFrame")
+        body.grid(row=1, column=0, sticky="nsew", pady=(12, 10))
+        body.columnconfigure(0, weight=0)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
 
-        hero = ttk.Frame(sidebar, style="Panel.TFrame")
-        hero.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 12))
-        hero.columnconfigure(0, weight=1)
+        left = ScrollableFrame(body, style="Panel.TFrame")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        left.configure(width=520)
+        left.content.columnconfigure(0, weight=1)
+        self._build_left_panel(left.content)
+
+        right = ttk.Frame(body, style="TFrame")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(2, weight=1)
+        self._build_right_panel(right)
+
+        self._build_bottom_panel(root)
+
+    def _load_logo_image(self) -> None:
+        logo_path = Path(__file__).resolve().parent.parent / "resources" / "images" / "logo.png"
+        try:
+            if logo_path.exists():
+                self.logo_image = tk.PhotoImage(file=str(logo_path))
+                self.header_logo_image = self.logo_image
+                width = max(1, self.logo_image.width())
+                height = max(1, self.logo_image.height())
+                max_header_size = 32
+                shrink = max(1, max((width + max_header_size - 1) // max_header_size, (height + max_header_size - 1) // max_header_size))
+                if shrink > 1:
+                    self.header_logo_image = self.logo_image.subsample(shrink, shrink)
+                try:
+                    self.iconphoto(True, self.logo_image)
+                except tk.TclError:
+                    pass
+        except Exception:
+            self.logo_image = None
+            self.header_logo_image = None
+
+    def _build_top_bar(self, parent: ttk.Frame) -> None:
+        bar = ttk.Frame(parent, style="TopBar.TFrame", height=72)
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.grid_propagate(False)
+        bar.columnconfigure(1, weight=1)
+        bar.columnconfigure(2, weight=0)
+        bar.columnconfigure(3, weight=0)
+
+        self._load_logo_image()
+        brand = ttk.Frame(bar, style="TopBar.TFrame")
+        brand.grid(row=0, column=0, sticky="w", padx=(6, 16), pady=10)
+        if self.header_logo_image is not None:
+            ttk.Label(brand, image=self.header_logo_image, style="TopBar.TLabel").grid(
+                row=0, column=0, rowspan=2, sticky="w", padx=(0, 10)
+            )
+        ttk.Label(brand, text=APP_TITLE, style="TopTitle.TLabel").grid(
+            row=0, column=1, sticky="w"
+        )
         ttk.Label(
-            hero, text="TurboLauncher", style="Panel.TLabel", font=self.TITLE_FONT
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            hero,
-            text="A cleaner control surface for llama-server",
-            style="CardMuted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+            brand,
+            text="Local llama-server launcher for models, presets, runtime, and live monitoring.",
+            style="TopBar.TLabel",
+        ).grid(row=1, column=1, sticky="w", pady=(2, 0))
 
-        status_card = ttk.Frame(sidebar, style="Card.TFrame")
-        status_card.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
-        status_card.columnconfigure(0, weight=1)
-        ttk.Label(status_card, text="SESSION", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", padx=12, pady=(10, 4)
-        )
-        ttk.Label(
-            status_card,
-            textvariable=self.metric_vars["status"],
-            style="Card.TLabel",
-            font=("Aptos Semibold", 13),
-        ).grid(row=1, column=0, sticky="w", padx=12)
-        ttk.Label(
-            status_card,
-            textvariable=self.metric_vars["model"],
-            style="CardMuted.TLabel",
-            wraplength=240,
-        ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
+        center = ttk.Frame(bar, style="TopBar.TFrame")
+        center.grid(row=0, column=1, sticky="ew", padx=8)
+        center.columnconfigure(0, weight=1)
+        profile = ttk.Frame(center, style="TopBar.TFrame")
+        profile.grid(row=0, column=0, sticky="w")
+        ttk.Label(profile, text="Active profile", style="TopBar.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(profile, textvariable=self.metric_vars["preset"], style="Pill.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 0))
 
-        quick = ttk.Frame(sidebar, style="Card.TFrame")
-        quick.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
-        quick.columnconfigure(0, weight=1)
-        ttk.Label(quick, text="QUICK ACTIONS", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", padx=12, pady=(10, 8)
+        self.status_dot = ttk.Label(bar, text="●", foreground=self.COLORS["muted"], background=self.COLORS["surface"], font=("Segoe UI", 18))
+        self.status_dot.grid(row=0, column=2, padx=(0, 8))
+        self.status_value_label = ttk.Label(bar, textvariable=self.metric_vars["status"], style="Status.TLabel")
+        self.status_value_label.grid(row=0, column=3, padx=(0, 14))
+        ttk.Button(bar, text="Start", style="Accent.TButton", command=self.start_server).grid(
+            row=0, column=4, padx=(0, 8)
         )
-        button_row1 = ttk.Frame(quick, style="Card.TFrame")
-        button_row1.grid(row=1, column=0, sticky="ew", padx=10)
-        button_row1.columnconfigure((0, 1), weight=1)
-        ttk.Button(
-            button_row1, text="Start", style="Accent.TButton", command=self.start_server
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 6))
-        ttk.Button(
-            button_row1, text="Stop", style="Danger.TButton", command=self.stop_server
-        ).grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=(0, 6))
-        button_row2 = ttk.Frame(quick, style="Card.TFrame")
-        button_row2.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
-        button_row2.columnconfigure((0, 1), weight=1)
-        ttk.Button(button_row2, text="Models", command=self.focus_models_tab).grid(
-            row=0, column=0, sticky="ew", padx=(0, 4)
+        ttk.Button(bar, text="Stop", style="Danger.TButton", command=self.stop_server).grid(
+            row=0, column=5, padx=(0, 8)
         )
-        ttk.Button(button_row2, text="Download", command=self.go_to_download_tab).grid(
-            row=0, column=1, sticky="ew", padx=(4, 0)
-        )
-        button_row3 = ttk.Frame(quick, style="Card.TFrame")
-        button_row3.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
-        button_row3.columnconfigure((0, 1), weight=1)
-        ttk.Button(button_row3, text="Add model", command=self.add_model_dialog).grid(
-            row=0, column=0, sticky="ew", padx=(0, 4)
-        )
-        ttk.Button(button_row3, text="Runtime", command=self.settings_dialog).grid(
-            row=0, column=1, sticky="ew", padx=(4, 0)
-        )
-        ttk.Button(quick, text="Save session", command=self.save_current_session).grid(
-            row=4, column=0, sticky="ew", padx=10, pady=(0, 10)
+        ttk.Button(bar, text="Runtime", command=self.settings_dialog).grid(
+            row=0, column=6, padx=(0, 6)
         )
 
-        preset_frame = ttk.Frame(sidebar, style="Card.TFrame")
-        preset_frame.grid(row=4, column=0, sticky="nsew", padx=14)
-        preset_frame.rowconfigure(1, weight=1)
-        preset_frame.columnconfigure(0, weight=1)
-        ttk.Label(preset_frame, text="PRESETS", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", padx=12, pady=(10, 6)
-        )
-        self.preset_list = tk.Listbox(
-            preset_frame,
-            bg="#0b1220",
-            fg=self.COLORS["text"],
-            selectbackground="#0ea5e9",
-            selectforeground="#001018",
-            activestyle="none",
-            highlightthickness=1,
-            highlightbackground="#334155",
-            relief="flat",
-            font=self.BODY_FONT,
-        )
-        self.preset_list.grid(row=1, column=0, sticky="nsew", padx=10)
-        preset_scroll = ttk.Scrollbar(
-            preset_frame, orient="vertical", command=self.preset_list.yview
-        )
-        preset_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 10))
-        self.preset_list.configure(yscrollcommand=preset_scroll.set)
+    def _build_left_panel(self, parent: ttk.Frame) -> None:
+        self._build_model_card(parent)
+        self._build_preset_card(parent)
+        self._build_runtime_card(parent)
 
-        preset_buttons = ttk.Frame(sidebar, style="Panel.TFrame")
-        preset_buttons.grid(row=6, column=0, sticky="ew", padx=14, pady=(12, 14))
-        preset_buttons.columnconfigure(0, weight=1)
-        preset_buttons.columnconfigure(1, weight=1)
-        ttk.Button(
-            preset_buttons, text="Save Preset", command=self.save_preset_dialog
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(preset_buttons, text="Reload", command=self.refresh_presets).grid(
-            row=0, column=1, sticky="ew", padx=(4, 0)
-        )
-
-    def _build_content(self, parent: ttk.Frame) -> None:
-        content = ttk.Frame(parent, style="TFrame")
-        content.grid(row=0, column=1, sticky="nsew")
-        content.rowconfigure(2, weight=1)
-        content.columnconfigure(0, weight=1)
-
-        header = ttk.Frame(content, style="TFrame")
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="Launch Console", style="Title.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        status_frame = ttk.Frame(header, style="TFrame")
-        status_frame.grid(row=0, column=1, sticky="e")
-        self.status_dot = ttk.Label(
-            status_frame,
-            text="●",
-            foreground=self.COLORS["muted"],
-            font=("Segoe UI", 18),
-        )
-        self.status_dot.grid(row=0, column=0, padx=(0, 6))
-        ttk.Label(
-            status_frame,
-            textvariable=self.metric_vars["status"],
-            font=("Segoe UI Semibold", 11),
-        ).grid(row=0, column=1)
-
-        summary = ttk.Frame(content, style="Panel.TFrame")
-        summary.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        for idx in range(4):
-            summary.columnconfigure(idx, weight=1)
-        self._summary_label(summary, "Model", self.metric_vars["model"], 0)
-        self._summary_label(summary, "Preset", self.metric_vars["preset"], 1)
-        self._summary_label(summary, "Throughput", self.metric_vars["tps"], 2)
-        self._summary_label(summary, "VRAM", self.metric_vars["vram"], 3)
-
-        work = ttk.Frame(content, style="TFrame")
-        work.grid(row=2, column=0, sticky="nsew")
-        work.rowconfigure(0, weight=1)
-        work.rowconfigure(1, weight=1)
-        work.columnconfigure(0, weight=1)
-
-        self.notebook = ttk.Notebook(work)
-        self.notebook.grid(row=0, column=0, sticky="nsew")
-        self.launch_tab = self._new_tab("Launch")
+        self.notebook = ttk.Notebook(parent)
+        self.notebook.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
+        self.launch_tab = self._new_tab("Overview")
         self.sampling_tab = self._new_tab("Sampling")
         self.server_tab = self._new_tab("Server")
         self.reasoning_tab = self._new_tab("Reasoning")
         self.monitoring_tab = self._new_tab("Monitoring")
+        self.chat_tab = self._new_tab("Chat")
         self.models_tab = self._new_tab("Models")
         self.models_notebook = ttk.Notebook(self.models_tab)
         self.models_notebook.pack(fill="both", expand=True)
@@ -427,47 +514,282 @@ class TurboLauncherApp(tk.Tk):
         self._build_server_tab()
         self._build_reasoning_tab()
         self._build_monitoring_tab()
+        self._build_chat_tab()
         self._build_models_tabs()
 
-        terminal_frame = ttk.Frame(work, style="Panel.TFrame")
-        terminal_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        terminal_frame.rowconfigure(1, weight=1)
-        terminal_frame.columnconfigure(0, weight=1)
-        action_bar = ttk.Frame(terminal_frame, style="Panel.TFrame")
-        action_bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
-        action_bar.columnconfigure(5, weight=1)
-        ttk.Button(
-            action_bar, text="START", style="Accent.TButton", command=self.start_server
-        ).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(
-            action_bar, text="STOP", style="Danger.TButton", command=self.stop_server
-        ).grid(row=0, column=1, padx=6)
-        ttk.Button(action_bar, text="Export Command", command=self.export_command).grid(
-            row=0, column=2, padx=6
+    def _build_model_card(self, parent: ttk.Frame) -> None:
+        card = ttk.Frame(parent, style="Card.TFrame")
+        card.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 12))
+        card.columnconfigure(0, weight=1)
+        inner = ttk.Frame(card, style="Card.TFrame")
+        inner.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+        inner.columnconfigure(0, minsize=92)
+        inner.columnconfigure(1, weight=1)
+        inner.columnconfigure(1, minsize=220)
+        inner.columnconfigure(2, minsize=88)
+        self._section_title(inner, "Model", "Pick the active GGUF model and keep its file details in view.")
+        ttk.Label(inner, text="Active model", style="CardMuted.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(2, 2)
         )
-        ttk.Button(action_bar, text="Runtime", command=self.settings_dialog).grid(
-            row=0, column=3, padx=6
+        self.launch_model_var = tk.StringVar(value="")
+        self.launch_model_picker = ttk.Combobox(
+            inner,
+            textvariable=self.launch_model_var,
+            state="readonly",
+            values=[],
+            width=30,
         )
-        ttk.Button(
-            action_bar, text="Clear", command=lambda: self.terminal.delete("1.0", "end")
-        ).grid(row=0, column=4, padx=6)
+        self.launch_model_picker.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(2, 2))
+        self.launch_model_picker.bind("<<ComboboxSelected>>", self._on_launch_model_selected)
+        ttk.Button(inner, text="Library", command=self.focus_models_tab).grid(row=1, column=2, sticky="e", padx=(8, 0))
+
+        self.model_context_vars = {
+            "Name": tk.StringVar(value="No model selected"),
+            "Alias": tk.StringVar(value="--"),
+            "Path": tk.StringVar(value="--"),
+            "Size": tk.StringVar(value="--"),
+            "Quant": tk.StringVar(value="--"),
+            "Source": tk.StringVar(value="--"),
+            "Suggestion": tk.StringVar(value="Pick a model in Models → Library to fill the overview and command preview."),
+        }
+        details = ttk.Frame(inner, style="Card.TFrame")
+        details.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        details.columnconfigure(1, weight=1)
+        for row, label in enumerate(["Name", "Alias", "Path", "Size", "Quant", "Source"]):
+            ttk.Label(details, text=f"{label}:", style="CardMuted.TLabel").grid(row=row, column=0, sticky="nw", padx=(0, 10), pady=3)
+            ttk.Label(details, textvariable=self.model_context_vars[label], style="Card.TLabel", wraplength=360).grid(row=row, column=1, sticky="nw", pady=3)
+        ttk.Label(inner, textvariable=self.model_context_vars["Suggestion"], style="CardMuted.TLabel", wraplength=360).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+    def _build_preset_card(self, parent: ttk.Frame) -> None:
+        card = ttk.Frame(parent, style="Card.TFrame")
+        card.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
+        card.columnconfigure(0, weight=1)
+        ttk.Label(card, text="PRESETS", style="Section.TLabel").grid(row=0, column=0, sticky="w", padx=14, pady=(12, 8))
+        self.preset_list = tk.Listbox(
+            card,
+            height=6,
+            bg=self.COLORS["surface2"],
+            fg=self.COLORS["text"],
+            selectbackground=self.COLORS["accent"],
+            selectforeground="#08111f",
+            activestyle="none",
+            highlightthickness=1,
+            highlightbackground=self.COLORS["line"],
+            highlightcolor=self.COLORS["accent"],
+            relief="flat",
+            borderwidth=0,
+            font=self.BODY_FONT,
+            exportselection=False,
+        )
+        self.preset_list.grid(row=1, column=0, sticky="ew", padx=14)
+        preset_scroll = ttk.Scrollbar(card, orient="vertical", command=self.preset_list.yview)
+        preset_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 14))
+        self.preset_list.configure(yscrollcommand=preset_scroll.set)
+        preset_buttons = ttk.Frame(card, style="Card.TFrame")
+        preset_buttons.grid(row=2, column=0, sticky="ew", padx=14, pady=12)
+        preset_buttons.columnconfigure(0, weight=1)
+        preset_buttons.columnconfigure(1, weight=1)
+        ttk.Button(preset_buttons, text="Save", command=self.save_preset_dialog).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(preset_buttons, text="Reload", command=self.refresh_presets).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+    def _build_runtime_card(self, parent: ttk.Frame) -> None:
+        card = ttk.Frame(parent, style="Card.TFrame")
+        card.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
+        card.columnconfigure(0, weight=1)
+        card.columnconfigure(1, weight=1)
+        card.columnconfigure(2, weight=1)
+        ttk.Label(card, text="RUNTIME", style="Section.TLabel").grid(row=0, column=0, sticky="w", padx=14, pady=(12, 6))
+        inner = ttk.Frame(card, style="Card.TFrame")
+        inner.grid(row=1, column=0, columnspan=3, sticky="ew", padx=14, pady=(0, 10))
+        inner.columnconfigure(0, weight=1)
+        inner.columnconfigure(1, weight=1)
+        ttk.Label(inner, text="GPU offload layers", style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
+        self.gpu_layers_label = ttk.Label(inner, text="30", foreground=self.COLORS["accent"], background=self.COLORS["panel"], font=("Segoe UI Semibold", 11))
+        self.gpu_layers_label.grid(row=0, column=1, sticky="e")
+        self.gpu_layers_scale = ttk.Scale(inner, from_=0, to=40, variable=self.vars["GpuLayers"], command=self._gpu_layers_changed)
+        self.gpu_layers_scale.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 10))
+        self.gpu_layers_scale.bind("<ButtonRelease-1>", self.on_setting_changed)
+        helper = ttk.Frame(card, style="Card.TFrame")
+        helper.grid(row=2, column=0, columnspan=3, sticky="ew", padx=14, pady=(0, 8))
+        helper.columnconfigure(0, weight=1)
+        ttk.Label(helper, textvariable=self.gpu_offload_help_var, style="CardMuted.TLabel", wraplength=430).grid(row=0, column=0, sticky="w")
+        self.full_offload_button = ttk.Button(helper, text="Full offload", command=self.set_full_offload_layers)
+        self.full_offload_button.grid(row=0, column=1, sticky="e", padx=(10, 0))
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=14, pady=(0, 12))
+        for idx in range(4):
+            row.columnconfigure(idx, weight=1)
+        self._entry(row, 0, 0, "Host", "Host", width=12)
+        self._entry(row, 0, 1, "Port", "Port", width=10)
+        self._combo(row, 0, 2, "Context", "CtxSize", ["4096", "8192", "16384", "32768", "65536", "131072"], state="normal")
+        self._combo(row, 0, 3, "Cache K", "CacheTypeK", CACHE_TYPES)
+        self._combo(row, 2, 0, "Cache V", "CacheTypeV", CACHE_TYPES)
+        self._combo(row, 2, 1, "Split Mode", "SplitMode", SPLIT_MODES)
+        self._entry(row, 2, 2, "Alias", "Alias", width=14)
+        self._check(row, 2, 3, "Flash Attn", "FlashAttn")
+
+    def _build_right_panel(self, parent: ttk.Frame) -> None:
+        self._build_status_card(parent)
+        self._build_endpoint_card(parent)
+        self._build_command_card(parent)
+
+    def _build_status_card(self, parent: ttk.Frame) -> None:
+        card = ttk.Frame(parent, style="Card.TFrame")
+        card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        card.columnconfigure(0, weight=1)
+        inner = ttk.Frame(card, style="Card.TFrame")
+        inner.grid(row=0, column=0, sticky="ew", padx=16, pady=16)
+        inner.columnconfigure(0, weight=1)
+        ttk.Label(inner, text="Current status", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(inner, textvariable=self.metric_vars["status"], style="StatusCard.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 6))
+        ttk.Label(inner, textvariable=self.metric_vars["model"], style="CardMuted.TLabel", wraplength=420).grid(row=2, column=0, sticky="w")
+        buttons = ttk.Frame(inner, style="Card.TFrame")
+        buttons.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+        buttons.columnconfigure(2, weight=1)
+        ttk.Button(buttons, text="Start", style="Accent.TButton", command=self.start_server).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(buttons, text="Stop", style="Danger.TButton", command=self.stop_server).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(buttons, text="Models", command=self.focus_models_tab).grid(row=0, column=2, sticky="ew", padx=(6, 0))
+
+    def _build_endpoint_card(self, parent: ttk.Frame) -> None:
+        card = ttk.Frame(parent, style="Card.TFrame")
+        card.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        card.columnconfigure(1, weight=1)
+        self._section_title(card, "Endpoint + resources", "Server address, estimate, and health at a glance.")
+        body = ttk.Frame(card, style="Card.TFrame")
+        body.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 14))
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, text="Endpoint", style="CardMuted.TLabel").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Label(body, textvariable=self.chat_endpoint_var, style="Card.TLabel").grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Label(body, text="Uptime", style="CardMuted.TLabel").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Label(body, textvariable=self.metric_vars["uptime"], style="Card.TLabel").grid(row=1, column=1, sticky="w", pady=3)
+        ttk.Label(body, text="VRAM estimate", style="CardMuted.TLabel").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Label(body, textvariable=self.metric_vars["vram_detail"], style="Card.TLabel").grid(row=2, column=1, sticky="w", pady=3)
+        self.vram_bar = ttk.Progressbar(body, maximum=16.0, value=0)
+        self.vram_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 10))
+        metrics = ttk.Frame(body, style="Card.TFrame")
+        metrics.grid(row=4, column=0, columnspan=2, sticky="ew")
+        for idx in range(4):
+            metrics.columnconfigure(idx, weight=1)
+        self._summary_label(metrics, "TPS", self.metric_vars["tps"], 0)
+        self._summary_label(metrics, "CPU", self.metric_vars["cpu"], 1)
+        self._summary_label(metrics, "RAM", self.metric_vars["ram"], 2)
+        self._summary_label(metrics, "GPU", self.metric_vars["gpu"], 3)
+
+    def _build_command_card(self, parent: ttk.Frame) -> None:
+        card = ttk.Frame(parent, style="Card.TFrame")
+        card.grid(row=2, column=0, sticky="nsew")
+        card.rowconfigure(1, weight=1)
+        card.columnconfigure(0, weight=1)
+        header = ttk.Frame(card, style="Card.TFrame")
+        header.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Generated command", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(header, text="Copy command", command=self.export_command).grid(row=0, column=1, sticky="e")
+        self.command_preview_text = tk.Text(
+            card,
+            bg=self.COLORS["surface2"],
+            fg=self.COLORS["text"],
+            insertbackground=self.COLORS["text"],
+            relief="flat",
+            height=7,
+            wrap="none",
+            font=("Consolas", 9),
+            borderwidth=0,
+        )
+        self.command_preview_text.grid(row=1, column=0, sticky="nsew", padx=16)
+        self.command_preview_text.configure(state="disabled")
+        cmd_scroll = ttk.Scrollbar(card, orient="horizontal", command=self.command_preview_text.xview)
+        cmd_scroll.grid(row=2, column=0, sticky="ew", padx=16, pady=(4, 14))
+        self.command_preview_text.configure(xscrollcommand=cmd_scroll.set)
+
+    def _build_bottom_panel(self, parent: ttk.Frame) -> None:
+        panel = ttk.Frame(parent, style="Panel.TFrame")
+        panel.grid(row=2, column=0, sticky="ew")
+        panel.rowconfigure(0, weight=1)
+        panel.columnconfigure(0, weight=1)
+        self.bottom_notebook = ttk.Notebook(panel)
+        self.bottom_notebook.grid(row=0, column=0, sticky="nsew", padx=0, pady=(0, 0))
+
+        logs_tab = ttk.Frame(self.bottom_notebook, style="Panel.TFrame")
+        metrics_tab = ttk.Frame(self.bottom_notebook, style="Panel.TFrame")
+        warnings_tab = ttk.Frame(self.bottom_notebook, style="Panel.TFrame")
+        self.bottom_notebook.add(logs_tab, text="Logs")
+        self.bottom_notebook.add(metrics_tab, text="Metrics")
+        self.bottom_notebook.add(warnings_tab, text="Warnings")
+
+        logs_tab.rowconfigure(1, weight=1)
+        logs_tab.columnconfigure(0, weight=1)
+        actions = ttk.Frame(logs_tab, style="Panel.TFrame")
+        actions.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+        actions.columnconfigure(3, weight=1)
+        ttk.Button(actions, text="Copy command", command=self.export_command).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(actions, text="Runtime", command=self.settings_dialog).grid(row=0, column=1, padx=6)
+        ttk.Button(actions, text="Clear logs", command=lambda: self.terminal.delete("1.0", "end")).grid(row=0, column=2, padx=6)
 
         self.terminal = tk.Text(
-            terminal_frame,
-            bg="#020617",
-            fg="#d1d5db",
-            insertbackground="#d1d5db",
+            logs_tab,
+            bg=self.COLORS["surface2"],
+            fg=self.COLORS["text"],
+            insertbackground=self.COLORS["text"],
             relief="flat",
-            height=11,
+            height=10,
             wrap="word",
             font=("Consolas", 10),
+            borderwidth=0,
         )
-        self.terminal.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        term_scroll = ttk.Scrollbar(
-            terminal_frame, orient="vertical", command=self.terminal.yview
-        )
-        term_scroll.grid(row=1, column=1, sticky="ns", pady=(0, 10))
+        self.terminal.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        term_scroll = ttk.Scrollbar(logs_tab, orient="vertical", command=self.terminal.yview)
+        term_scroll.grid(row=1, column=1, sticky="ns", pady=(0, 12))
         self.terminal.configure(yscrollcommand=term_scroll.set)
+
+        metrics_scroll = ScrollableFrame(metrics_tab, style="Panel.TFrame")
+        metrics_scroll.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        metrics_body = metrics_scroll.content
+        metrics_body.columnconfigure(0, weight=1)
+        metrics_body.columnconfigure(1, weight=1)
+        metrics_body.columnconfigure(2, weight=1)
+        metrics_body.columnconfigure(3, weight=1)
+        for idx, (label, key) in enumerate([
+            ("Status", "status"),
+            ("Uptime", "uptime"),
+            ("Tokens/sec", "tps"),
+            ("Prompt eval/sec", "peps"),
+            ("Decode ms/token", "decode_time"),
+            ("Prompt ms/token", "prompt_time"),
+            ("Context", "context"),
+            ("KV Cache", "kv_cache"),
+            ("Prompt Tokens", "prompt_tokens"),
+            ("Generated Tokens", "tokens"),
+            ("Active Requests", "requests_active"),
+            ("Queued Requests", "requests_queued"),
+            ("Active Slot", "session_slot"),
+            ("Session Progress", "session_progress"),
+            ("Prompt Progress", "prompt_progress"),
+            ("Prompt Processed", "prompt_processed"),
+            ("Session Decoded", "session_decoded"),
+            ("Session Remaining", "session_remaining"),
+        ]):
+            row = idx // 2
+            col = (idx % 2) * 2
+            ttk.Label(metrics_body, text=label, style="Panel.TLabel", foreground=self.COLORS["muted"]).grid(row=row, column=col, sticky="w", padx=12, pady=7)
+            ttk.Label(metrics_body, textvariable=self.metric_vars[key], style="Panel.TLabel", font=("Segoe UI Semibold", 10)).grid(row=row, column=col + 1, sticky="w", padx=12, pady=7)
+
+        self.warning_text = tk.Text(
+            warnings_tab,
+            bg=self.COLORS["surface2"],
+            fg=self.COLORS["text"],
+            insertbackground=self.COLORS["text"],
+            relief="flat",
+            height=5,
+            wrap="word",
+            font=self.BODY_FONT,
+            borderwidth=0,
+            state="disabled",
+        )
+        self.warning_text.pack(fill="both", expand=True, padx=12, pady=12)
+        self._update_warning_notes()
 
     def _summary_label(
         self, parent: ttk.Frame, title: str, var: tk.StringVar, col: int
@@ -495,7 +817,9 @@ class TurboLauncherApp(tk.Tk):
         return frame
 
     def _grid_container(self, parent: ttk.Frame) -> ttk.Frame:
-        frame = ttk.Frame(parent, style="TFrame")
+        scroll = ScrollableFrame(parent, style="TFrame")
+        scroll.grid(row=0, column=0, sticky="nsew")
+        frame = ttk.Frame(scroll.content, style="TFrame")
         frame.grid(row=0, column=0, sticky="new", padx=18, pady=18)
         for col in range(4):
             frame.columnconfigure(col, weight=1)
@@ -574,165 +898,36 @@ class TurboLauncherApp(tk.Tk):
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=1)
 
-        hero = ttk.Frame(tab, style="TFrame")
-        hero.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 0))
-        hero.columnconfigure(0, weight=1)
-        hero.rowconfigure(0, weight=0)
-        hero.rowconfigure(1, weight=1)
-
-        model_card = ttk.Frame(hero, style="Card.TFrame")
-        model_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        model_card.columnconfigure(0, weight=1)
-        model_inner = ttk.Frame(model_card, style="Card.TFrame")
-        model_inner.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
-        model_inner.columnconfigure(1, weight=1)
-
+        frame = ttk.Frame(tab, style="TFrame")
+        frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        frame.columnconfigure(0, weight=1)
         self._section_title(
-            model_inner,
-            "Selected model",
-            "Model selection lives in the Models workspace; this card keeps the active model and launch context in view.",
+            frame,
+            "Overview",
+            "A compact launch dashboard with model context, launch guidance, and shortcuts for the active profile.",
         )
-        picker_row = ttk.Frame(model_inner, style="Card.TFrame")
-        picker_row.grid(row=1, column=0, sticky="ew", columnspan=2, pady=(0, 10))
-        picker_row.columnconfigure(1, weight=1)
-        ttk.Label(picker_row, text="Model", style="CardMuted.TLabel").grid(
-            row=0, column=0, sticky="w", padx=(0, 10)
-        )
-        self.launch_model_var = tk.StringVar(value="")
-        self.launch_model_picker = ttk.Combobox(
-            picker_row,
-            textvariable=self.launch_model_var,
-            state="readonly",
-            values=[],
-        )
-        self.launch_model_picker.grid(row=0, column=1, sticky="ew")
-        self.launch_model_picker.bind(
-            "<<ComboboxSelected>>", self._on_launch_model_selected
-        )
-        ttk.Button(picker_row, text="Library", command=self.focus_models_tab).grid(
-            row=0, column=2, sticky="e", padx=(8, 0)
-        )
-        details = ttk.Frame(model_inner, style="Card.TFrame")
-        details.grid(row=2, column=0, sticky="ew", columnspan=2)
-        details.columnconfigure(1, weight=1)
 
-        self.model_context_vars = {
-            "Name": tk.StringVar(value="No model selected"),
-            "Alias": tk.StringVar(value="--"),
-            "Path": tk.StringVar(value="--"),
-            "Size": tk.StringVar(value="--"),
-            "Quant": tk.StringVar(value="--"),
-            "Source": tk.StringVar(value="--"),
-            "Suggestion": tk.StringVar(value="Pick a model in Models → Library."),
-        }
-        labels = ["Name", "Alias", "Path", "Size", "Quant", "Source"]
-        for row, label in enumerate(labels):
-            ttk.Label(details, text=f"{label}:", style="CardMuted.TLabel").grid(
-                row=row, column=0, sticky="nw", padx=(0, 10), pady=4
-            )
-            ttk.Label(
-                details,
-                textvariable=self.model_context_vars[label],
-                style="Card.TLabel",
-                wraplength=700,
-            ).grid(row=row, column=1, sticky="nw", pady=4)
+        info = ttk.Frame(frame, style="Card.TFrame")
+        info.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        info.columnconfigure(1, weight=1)
+        for row, (label, key) in enumerate([("Model", "model"), ("Preset", "preset"), ("Status", "status"), ("VRAM", "vram")]):
+            ttk.Label(info, text=label, style="CardMuted.TLabel").grid(row=row, column=0, sticky="w", padx=14, pady=6)
+            ttk.Label(info, textvariable=self.metric_vars[key], style="Card.TLabel").grid(row=row, column=1, sticky="w", padx=14, pady=6)
 
-        self.model_context_notes = self.model_context_vars["Suggestion"]
-        ttk.Label(
-            model_inner,
-            textvariable=self.model_context_notes,
-            style="CardMuted.TLabel",
-            wraplength=860,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        guidance = ttk.Frame(frame, style="Card.TFrame")
+        guidance.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        guidance.columnconfigure(0, weight=1)
+        self._section_title(guidance, "Launch guidance", "Use the left panel to pick the model and core runtime shape; advanced tabs stay tucked away below.")
+        ttk.Label(guidance, textvariable=self.model_context_vars["Suggestion"], style="CardMuted.TLabel", wraplength=860).grid(row=1, column=0, sticky="w", padx=14, pady=(0, 14))
 
-        actions = ttk.Frame(model_inner, style="Card.TFrame")
-        actions.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        actions = ttk.Frame(frame, style="Card.TFrame")
+        actions.grid(row=3, column=0, sticky="ew")
         for idx in range(4):
             actions.columnconfigure(idx, weight=1)
-        ttk.Button(
-            actions, text="Open folder", command=self.open_selected_model_folder
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        ttk.Button(
-            actions, text="Copy path", command=self.copy_selected_model_path
-        ).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(actions, text="Go to Models", command=self.focus_models_tab).grid(
-            row=0, column=2, sticky="ew", padx=6
-        )
-        ttk.Button(actions, text="Export command", command=self.export_command).grid(
-            row=0, column=3, sticky="ew", padx=(6, 0)
-        )
-
-        tuning_card = ttk.Frame(hero, style="Card.TFrame")
-        tuning_card.grid(row=1, column=0, sticky="nsew")
-        tuning_card.columnconfigure(0, weight=1)
-        tuning_inner = ttk.Frame(tuning_card, style="Card.TFrame")
-        tuning_inner.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
-        tuning_inner.columnconfigure((0, 1, 2, 3), weight=1)
-        self._section_title(
-            tuning_inner,
-            "Model runtime",
-            "Tune the settings that most directly affect model placement, memory, and launch shape.",
-        )
-
-        ttk.Label(tuning_inner, text="GPU Layers", style="Card.TLabel").grid(
-            row=1, column=0, sticky="w", padx=8, pady=(2, 2)
-        )
-        self.gpu_layers_label = ttk.Label(
-            tuning_inner,
-            text="30",
-            foreground=self.COLORS["accent"],
-            background=self.COLORS["panel"],
-            font=("Aptos Semibold", 11),
-        )
-        self.gpu_layers_label.grid(row=1, column=1, sticky="w", pady=(2, 2))
-        scale = ttk.Scale(
-            tuning_inner,
-            from_=0,
-            to=40,
-            variable=self.vars["GpuLayers"],
-            command=self._gpu_layers_changed,
-        )
-        scale.grid(row=2, column=0, columnspan=4, sticky="ew", padx=8, pady=(0, 12))
-        scale.bind("<ButtonRelease-1>", self.on_setting_changed)
-
-        self._entry(tuning_inner, 3, 0, "CPU MoE Layers", "NcpuMoe")
-        self._combo(
-            tuning_inner,
-            3,
-            1,
-            "Context Size",
-            "CtxSize",
-            ["4096", "8192", "16384", "32768", "65536", "131072"],
-            state="normal",
-        )
-        self._combo(tuning_inner, 3, 2, "Cache K", "CacheTypeK", CACHE_TYPES)
-        self._combo(tuning_inner, 3, 3, "Cache V", "CacheTypeV", CACHE_TYPES)
-        self._combo(tuning_inner, 5, 0, "Split Mode", "SplitMode", SPLIT_MODES)
-        self._entry(tuning_inner, 5, 1, "Tensor Split", "TensorSplit")
-        self._check(tuning_inner, 5, 2, "Flash Attention", "FlashAttn")
-        self._entry(tuning_inner, 5, 3, "Alias", "Alias", width=18)
-
-        self._entry(tuning_inner, 7, 0, "Threads", "Threads")
-        self._entry(tuning_inner, 7, 1, "Batch Size", "BatchSize")
-        self._entry(tuning_inner, 7, 2, "UBatch Size", "UBatchSize")
-        self._check(tuning_inner, 7, 3, "Lock memory", "Mlock")
-        self._check(tuning_inner, 8, 3, "Disable mmap", "NoMmap")
-
-        vram_frame = ttk.Frame(tuning_inner, style="Card.TFrame")
-        vram_frame.grid(
-            row=9, column=0, columnspan=4, sticky="ew", padx=8, pady=(10, 0)
-        )
-        vram_frame.columnconfigure(0, weight=1)
-        ttk.Label(vram_frame, text="Estimated VRAM", style="Card.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Label(
-            vram_frame,
-            textvariable=self.metric_vars["vram_detail"],
-            style="CardMuted.TLabel",
-        ).grid(row=0, column=1, sticky="e")
-        self.vram_bar = ttk.Progressbar(vram_frame, maximum=16.0, value=0)
-        self.vram_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 2))
+        ttk.Button(actions, text="Open folder", command=self.open_selected_model_folder).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(actions, text="Copy path", command=self.copy_selected_model_path).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(actions, text="Go to Models", command=self.focus_models_tab).grid(row=0, column=2, sticky="ew", padx=6)
+        ttk.Button(actions, text="Copy command", command=self.export_command).grid(row=0, column=3, sticky="ew", padx=(6, 0))
 
     def _build_sampling_tab(self) -> None:
         tab = self.sampling_tab
@@ -772,7 +967,7 @@ class TurboLauncherApp(tk.Tk):
         self._check(frame, 4, 3, "Continuous batching", "ContBatching")
         ttk.Label(
             frame,
-            text="Server-level flags stay here; model-specific placement and memory controls are grouped in Launch.",
+            text="Server-level flags stay here; model-specific placement and memory controls are grouped in Overview.",
             foreground=self.COLORS["muted"],
         ).grid(row=6, column=0, columnspan=4, sticky="w", padx=8, pady=(10, 0))
 
@@ -804,7 +999,16 @@ class TurboLauncherApp(tk.Tk):
             ("Context", "context"),
             ("KV Cache", "kv_cache"),
             ("Total Tokens", "tokens"),
+            ("Prompt Tokens", "prompt_tokens"),
             ("Requests", "requests"),
+            ("Active Requests", "requests_active"),
+            ("Queued Requests", "requests_queued"),
+            ("Active Slot", "session_slot"),
+            ("Session Progress", "session_progress"),
+            ("Prompt Progress", "prompt_progress"),
+            ("Prompt Processed", "prompt_processed"),
+            ("Session Decoded", "session_decoded"),
+            ("Session Remaining", "session_remaining"),
             ("CPU", "cpu"),
             ("RAM", "ram"),
             ("GPU", "gpu"),
@@ -822,12 +1026,445 @@ class TurboLauncherApp(tk.Tk):
                 font=("Segoe UI Semibold", 10),
             ).grid(row=row, column=col + 1, sticky="w", padx=8, pady=7)
 
+    def _build_chat_tab(self) -> None:
+        tab = self.chat_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        tab.rowconfigure(2, weight=0)
+
+        top_card = ttk.Frame(tab, style="Card.TFrame")
+        top_card.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 10))
+        top_inner = ttk.Frame(top_card, style="Card.TFrame")
+        top_inner.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+        top_inner.columnconfigure(1, weight=1)
+        self._section_title(
+            top_inner,
+            "Chat",
+            "Stream replies from the active llama-server using the current host, port, and selected model.",
+        )
+
+        controls = ttk.Frame(top_inner, style="Card.TFrame")
+        controls.grid(row=1, column=0, columnspan=2, sticky="ew")
+        controls.columnconfigure(1, weight=1)
+        controls.columnconfigure(3, weight=1)
+        ttk.Label(controls, text="Model", style="CardMuted.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        self.chat_model_label = ttk.Label(
+            controls, textvariable=self.metric_vars["model"], style="Card.TLabel"
+        )
+        self.chat_model_label.grid(row=0, column=1, sticky="w")
+        ttk.Label(controls, text="Endpoint", style="CardMuted.TLabel").grid(
+            row=0, column=2, sticky="w", padx=(16, 8)
+        )
+        ttk.Label(
+            controls, textvariable=self.chat_endpoint_var, style="Card.TLabel"
+        ).grid(row=0, column=3, sticky="w")
+
+        actions = ttk.Frame(top_inner, style="Card.TFrame")
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        actions.columnconfigure(5, weight=1)
+        self.chat_settings_toggle = ttk.Button(
+            actions, text="Show Settings", command=self.toggle_chat_settings
+        )
+        self.chat_settings_toggle.grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(actions, text="Use Model Defaults", command=self.reset_chat_overrides).grid(
+            row=0, column=1, padx=6
+        )
+        ttk.Button(actions, text="Clear Chat", command=self.clear_chat_history).grid(
+            row=0, column=2, padx=6
+        )
+        ttk.Label(
+            actions, textvariable=self.chat_status_var, style="CardMuted.TLabel"
+        ).grid(row=0, column=6, sticky="e")
+
+        self.chat_settings_panel = ttk.Frame(top_inner, style="CardInner.TFrame")
+        self.chat_settings_panel.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        self.chat_settings_panel.columnconfigure(0, weight=1)
+        self.chat_settings_panel.columnconfigure(1, weight=1)
+        ttk.Label(
+            self.chat_settings_panel, text="Loaded model id", style="CardMuted.TLabel"
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 2))
+        ttk.Label(
+            self.chat_settings_panel, textvariable=self.chat_model_id_var, style="Card.TLabel"
+        ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
+        ttk.Label(
+            self.chat_settings_panel, text="Prompt template", style="CardMuted.TLabel"
+        ).grid(row=0, column=1, sticky="w", padx=10, pady=(10, 2))
+        ttk.Label(
+            self.chat_settings_panel,
+            textvariable=self.chat_template_note_var,
+            style="CardMuted.TLabel",
+            wraplength=420,
+        ).grid(row=1, column=1, sticky="w", padx=10, pady=(0, 10))
+
+        ttk.Label(
+            self.chat_settings_panel, text="System prompt", style="CardMuted.TLabel"
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 4))
+        self.chat_system_prompt = tk.Text(
+            self.chat_settings_panel,
+            bg="#0b1220",
+            fg=self.COLORS["text"],
+            insertbackground=self.COLORS["text"],
+            relief="flat",
+            height=6,
+            wrap="word",
+            font=self.BODY_FONT,
+        )
+        self.chat_system_prompt.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+        ttk.Label(
+            self.chat_settings_panel, text="Prompt template", style="CardMuted.TLabel"
+        ).grid(row=2, column=1, sticky="w", padx=10, pady=(0, 4))
+        self.chat_template_text = tk.Text(
+            self.chat_settings_panel,
+            bg="#0b1220",
+            fg=self.COLORS["text"],
+            insertbackground=self.COLORS["text"],
+            relief="flat",
+            height=6,
+            wrap="word",
+            font=("Consolas", 10),
+        )
+        self.chat_template_text.grid(row=3, column=1, sticky="nsew", padx=10, pady=(0, 10))
+
+        self.chat_settings_panel.grid_remove()
+
+        history_card = ttk.Frame(tab, style="Panel.TFrame")
+        history_card.grid(row=1, column=0, sticky="nsew", padx=8)
+        history_card.rowconfigure(0, weight=1)
+        history_card.columnconfigure(0, weight=1)
+        self.chat_history_text = tk.Text(
+            history_card,
+            bg="#020617",
+            fg="#d1d5db",
+            insertbackground="#d1d5db",
+            relief="flat",
+            wrap="word",
+            state="disabled",
+            font=("Segoe UI", 10),
+        )
+        self.chat_history_text.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.chat_history_text.tag_configure("user_header", foreground=self.COLORS["accent"])
+        self.chat_history_text.tag_configure("assistant_header", foreground=self.COLORS["green"])
+        self.chat_history_text.tag_configure("system_header", foreground=self.COLORS["orange"])
+        self.chat_history_text.tag_configure("body", foreground=self.COLORS["text"])
+        chat_scroll = ttk.Scrollbar(
+            history_card, orient="vertical", command=self.chat_history_text.yview
+        )
+        chat_scroll.grid(row=0, column=1, sticky="ns", pady=10)
+        self.chat_history_text.configure(yscrollcommand=chat_scroll.set)
+
+        input_card = ttk.Frame(tab, style="Card.TFrame")
+        input_card.grid(row=2, column=0, sticky="ew", padx=8, pady=(10, 8))
+        input_card.columnconfigure(0, weight=1)
+        ttk.Label(input_card, text="Message", style="CardMuted.TLabel").grid(
+            row=0, column=0, sticky="w", padx=14, pady=(12, 4)
+        )
+        self.chat_input = tk.Text(
+            input_card,
+            bg="#0b1220",
+            fg=self.COLORS["text"],
+            insertbackground=self.COLORS["text"],
+            relief="flat",
+            height=4,
+            wrap="word",
+            font=self.BODY_FONT,
+        )
+        self.chat_input.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
+        self.chat_input.bind("<Return>", self._chat_input_return)
+        self.chat_input.bind("<Shift-Return>", self._chat_input_shift_return)
+        buttons = ttk.Frame(input_card, style="Card.TFrame")
+        buttons.grid(row=1, column=1, sticky="ns", padx=(0, 14), pady=(0, 10))
+        self.chat_send_button = ttk.Button(
+            buttons, text="Send", style="Accent.TButton", command=self.send_chat_message
+        )
+        self.chat_send_button.grid(row=0, column=0, sticky="ew")
+
     def _wire_events(self) -> None:
         self.preset_list.bind("<<ListboxSelect>>", self.on_preset_selected)
         if hasattr(self, "models_library_list"):
             self.models_library_list.bind(
                 "<<ListboxSelect>>", self._on_library_selected
             )
+        if hasattr(self, "chat_system_prompt"):
+            self.chat_system_prompt.bind("<FocusOut>", self._on_chat_settings_changed)
+        if hasattr(self, "chat_template_text"):
+            self.chat_template_text.bind("<FocusOut>", self._on_chat_settings_changed)
+
+    def toggle_chat_settings(self) -> None:
+        self.chat_settings_visible = not self.chat_settings_visible
+        if self.chat_settings_visible:
+            self.chat_settings_panel.grid()
+            self.chat_settings_toggle.configure(text="Hide Settings")
+        else:
+            self.chat_settings_panel.grid_remove()
+            self.chat_settings_toggle.configure(text="Show Settings")
+
+    def _chat_storage_key(self, model: ModelEntry | None = None) -> str:
+        model = model or self.selected_model
+        if not model:
+            return "default"
+        return sanitize_alias(model.alias or model.name, 80)
+
+    def _load_chat_state(self) -> None:
+        try:
+            with self.chat_state_file.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.chat_state = data
+        except Exception:
+            self.chat_state = {"models": {}}
+        if "models" not in self.chat_state or not isinstance(
+            self.chat_state.get("models"), dict
+        ):
+            self.chat_state = {"models": {}}
+
+    def _save_chat_state(self) -> None:
+        if self._loading:
+            return
+        try:
+            self.chat_state_file.parent.mkdir(parents=True, exist_ok=True)
+            with self.chat_state_file.open("w", encoding="utf-8") as f:
+                json.dump(self.chat_state, f, indent=2)
+        except OSError as exc:
+            self.log(f"[WARN] Failed to save chat state: {exc}")
+
+    @staticmethod
+    def _text_widget_value(widget: tk.Text) -> str:
+        return widget.get("1.0", "end").rstrip()
+
+    @staticmethod
+    def _set_text_widget_value(widget: tk.Text, value: str) -> None:
+        widget.delete("1.0", "end")
+        if value:
+            widget.insert("1.0", value)
+
+    def _current_system_prompt(self) -> str:
+        if hasattr(self, "chat_system_prompt"):
+            return self._text_widget_value(self.chat_system_prompt)
+        return self.selected_model.sys_prompt if self.selected_model else ""
+
+    def _current_chat_template(self) -> str:
+        if hasattr(self, "chat_template_text"):
+            return self._text_widget_value(self.chat_template_text)
+        return self.selected_model.chat_template if self.selected_model else ""
+
+    def _store_chat_model_state(self) -> None:
+        if not self.selected_model:
+            return
+        key = self._chat_storage_key(self.selected_model)
+        models_state = self.chat_state.setdefault("models", {})
+        models_state[key] = {
+            "system_prompt": self._current_system_prompt(),
+            "chat_template": self._current_chat_template(),
+            "history": [
+                {"role": message.role, "content": message.content}
+                for message in self.chat_history
+                if message.content.strip()
+            ],
+        }
+        self._save_chat_state()
+
+    def _load_chat_for_selected_model(self) -> None:
+        if not hasattr(self, "chat_history_text"):
+            return
+        model = self.selected_model
+        system_prompt = model.sys_prompt if model else ""
+        chat_template = model.chat_template if model else ""
+        history: list[ChatMessage] = []
+        if model:
+            state = self.chat_state.get("models", {}).get(self._chat_storage_key(model), {})
+            if isinstance(state, dict):
+                system_prompt = str(state.get("system_prompt", system_prompt or ""))
+                chat_template = str(state.get("chat_template", chat_template or ""))
+                raw_history = state.get("history", [])
+                if isinstance(raw_history, list):
+                    for item in raw_history:
+                        if isinstance(item, dict):
+                            role = str(item.get("role", "assistant"))
+                            content = str(item.get("content", ""))
+                            if content:
+                                history.append(ChatMessage(role=role, content=content))
+        self.chat_history = history
+        if hasattr(self, "chat_system_prompt"):
+            self._set_text_widget_value(self.chat_system_prompt, system_prompt)
+        if hasattr(self, "chat_template_text"):
+            self._set_text_widget_value(self.chat_template_text, chat_template)
+        if model and model.chat_template:
+            self.chat_template_note_var.set(
+                "Template changes apply on next server start and are added to the launch command."
+            )
+        else:
+            self.chat_template_note_var.set(
+                "Template changes apply on next server start."
+            )
+        self.chat_model_id_var.set(model.alias if model else "--")
+        self._update_chat_endpoint_preview()
+        self._render_chat_history()
+
+    def _render_chat_history(self) -> None:
+        if not hasattr(self, "chat_history_text"):
+            return
+        text = self.chat_history_text
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        for message in self.chat_history:
+            header_tag = {
+                "user": "user_header",
+                "assistant": "assistant_header",
+                "system": "system_header",
+            }.get(message.role, "assistant_header")
+            label = {
+                "user": "You",
+                "assistant": "Assistant",
+                "system": "System",
+            }.get(message.role, message.role.title())
+            text.insert("end", f"[{label}] ", header_tag)
+            text.insert("end", f"{message.content}\n\n", "body")
+        text.configure(state="disabled")
+        text.see("end")
+
+    def _append_chat_message_view(self, role: str, content: str) -> None:
+        self.chat_history.append(ChatMessage(role=role, content=content))
+        self._render_chat_history()
+
+    def _replace_last_chat_message(self, role: str, content: str) -> None:
+        if self.chat_history and self.chat_history[-1].role == role:
+            self.chat_history[-1] = ChatMessage(role=role, content=content)
+        else:
+            self.chat_history.append(ChatMessage(role=role, content=content))
+        self._render_chat_history()
+
+    def _update_chat_endpoint_preview(self) -> None:
+        settings = self.collect_settings(strict=False)
+        self.chat_endpoint_var.set(f"{settings['Host']}:{settings['Port']}")
+
+    def _write_chat_template_file(self) -> Path | None:
+        template = self._current_chat_template().strip()
+        if not template:
+            return None
+        model_key = self._chat_storage_key()
+        out_dir = SESSION_DIR / "chat-templates"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{model_key}.jinja"
+        path.write_text(template, encoding="utf-8")
+        return path
+
+    def _augment_server_args_with_chat(self, server_args: OrderedDict[str, Any]) -> OrderedDict[str, Any]:
+        args = OrderedDict(server_args)
+        template_path = self._write_chat_template_file()
+        if template_path:
+            args["chat-template-file"] = str(template_path)
+        return args
+
+    def _on_chat_settings_changed(self, _event: tk.Event | None = None) -> None:
+        if self._loading:
+            return
+        self._store_chat_model_state()
+
+    def reset_chat_overrides(self) -> None:
+        if not self.selected_model:
+            return
+        self._set_text_widget_value(self.chat_system_prompt, self.selected_model.sys_prompt)
+        self._set_text_widget_value(self.chat_template_text, self.selected_model.chat_template)
+        self._store_chat_model_state()
+
+    def clear_chat_history(self) -> None:
+        if self.chat_request_in_flight:
+            return
+        self.chat_history = []
+        self._render_chat_history()
+        self._store_chat_model_state()
+
+    def _chat_input_return(self, _event: tk.Event) -> str:
+        self.send_chat_message()
+        return "break"
+
+    def _chat_input_shift_return(self, event: tk.Event) -> str:
+        event.widget.insert("insert", "\n")
+        return "break"
+
+    def send_chat_message(self) -> None:
+        if self.chat_request_in_flight:
+            return
+        if not self.selected_model:
+            messagebox.showwarning("Chat", "Select a model first.", parent=self)
+            return
+        prompt = self._text_widget_value(self.chat_input)
+        if not prompt.strip():
+            return
+        settings = self.collect_settings(strict=False)
+        host = str(settings["Host"])
+        port = int(settings["Port"])
+        self.chat_request_in_flight = True
+        self.chat_status_var.set("Streaming...")
+        self.metric_vars["prompt_progress"].set("--")
+        self.metric_vars["prompt_processed"].set("--")
+        self.chat_send_button.configure(state="disabled")
+        self._append_chat_message_view("user", prompt.strip())
+        self._set_text_widget_value(self.chat_input, "")
+        self._append_chat_message_view("assistant", "")
+        self._store_chat_model_state()
+        threading.Thread(
+            target=self._chat_stream_worker,
+            args=(host, port, prompt.strip(), float(settings["Temp"])),
+            daemon=True,
+        ).start()
+
+    def _chat_stream_worker(self, host: str, port: int, prompt: str, temperature: float) -> None:
+        model_id = get_model_id(host, port) or (self.selected_model.alias if self.selected_model else "model")
+        messages = [message for message in self.chat_history[:-1] if message.content.strip()]
+        system_prompt = self._current_system_prompt().strip()
+        if system_prompt:
+            messages = [ChatMessage(role="system", content=system_prompt), *messages]
+        assistant_parts: list[str] = []
+        try:
+            self.after(0, lambda: self.chat_model_id_var.set(model_id))
+            for event in stream_chat_events(
+                host,
+                port,
+                messages,
+                model=model_id,
+                extra={"temperature": temperature, "return_progress": True},
+            ):
+                prompt_progress = event.get("prompt_progress") if isinstance(event, dict) else None
+                if isinstance(prompt_progress, dict):
+                    processed = int(prompt_progress.get("processed") or 0)
+                    total = int(prompt_progress.get("total") or 0)
+                    if total > 0:
+                        self.after(0, lambda p=processed, t=total: self.metric_vars["prompt_progress"].set(f"{(p / t) * 100:.0f}%"))
+                    self.after(0, lambda p=processed: self.metric_vars["prompt_processed"].set(f"{p:,}"))
+
+                choices = event.get("choices") if isinstance(event, dict) else None
+                if not isinstance(choices, list):
+                    continue
+                for choice in choices:
+                    if not isinstance(choice, dict):
+                        continue
+                    delta = choice.get("delta") or {}
+                    if not isinstance(delta, dict):
+                        continue
+                    content_chunk = delta.get("content")
+                    if isinstance(content_chunk, str) and content_chunk:
+                        assistant_parts.append(content_chunk)
+                        content = "".join(assistant_parts)
+                        self.after(0, lambda text=content: self._replace_last_chat_message("assistant", text))
+        except ChatAPIError as exc:
+            message = str(exc)
+            self.after(0, lambda: self._replace_last_chat_message("assistant", f"[ERROR] {message}"))
+            self.after(0, lambda: self.chat_status_var.set("Error"))
+        else:
+            self.after(0, lambda: self.chat_status_var.set("Idle"))
+        finally:
+            self.after(0, self._finish_chat_request)
+
+    def _finish_chat_request(self) -> None:
+        self.chat_request_in_flight = False
+        self.chat_send_button.configure(state="normal")
+        if self.chat_status_var.get() == "Streaming...":
+            self.chat_status_var.set("Idle")
+        self._store_chat_model_state()
 
     def go_to_download_tab(self) -> None:
         self.notebook.select(self.models_tab)
@@ -839,6 +1476,7 @@ class TurboLauncherApp(tk.Tk):
 
     def _initialize_data(self) -> None:
         self._loading = True
+        self._load_chat_state()
         self.refresh_models(log_result=True)
         self.refresh_presets(select_first=False)
 
@@ -866,11 +1504,12 @@ class TurboLauncherApp(tk.Tk):
 
         self._loading = False
         self.update_vram_estimate()
-        self.log("TurboLauncher Python initialized")
+        self._update_chat_endpoint_preview()
+        self._update_command_preview()
+        self._update_warning_notes()
+        self.log(f"{APP_TITLE} initialized")
         self.log(f"Launcher dir: {APP_DIR}")
-        self.log(
-            "Ready. Pick a model in Models → Library, tune Launch, then click START."
-        )
+        self.log("Ready. Pick a model, choose a preset, tune runtime, then click START.")
         if not self.core.resolve_runtime_executable():
             self.log("Tip: use Runtime to choose llama-server.exe.")
 
@@ -924,6 +1563,8 @@ class TurboLauncherApp(tk.Tk):
             self.set_selected_model(self.models[index])
 
     def clear_selected_model(self, *, persist: bool = True) -> None:
+        if self.selected_model:
+            self._store_chat_model_state()
         self.selected_model = None
         self.metric_vars["model"].set("No model selected")
         self.metric_vars["model_size"].set("--")
@@ -931,13 +1572,18 @@ class TurboLauncherApp(tk.Tk):
             self.launch_model_var.set("")
         self.update_model_details(None)
         self._update_model_context(None)
+        self._load_chat_for_selected_model()
         if hasattr(self, "models_library_list"):
             self.models_library_list.selection_clear(0, "end")
         self.update_vram_estimate()
+        self._update_command_preview()
+        self._update_warning_notes()
         if persist:
             self.save_session_debounced()
 
     def set_selected_model(self, model: ModelEntry, *, persist: bool = True) -> None:
+        if self.selected_model and self.selected_model.path != model.path:
+            self._store_chat_model_state()
         self.selected_model = model
         self.metric_vars["model"].set(model.name)
         self.metric_vars["model_size"].set(f"{model.size_gb:g} GB")
@@ -948,7 +1594,10 @@ class TurboLauncherApp(tk.Tk):
         self.update_model_details(model)
         self._update_model_context(model)
         self._sync_library_selection()
+        self._load_chat_for_selected_model()
         self.update_vram_estimate()
+        self._update_command_preview()
+        self._update_warning_notes()
         if persist:
             self.save_session_debounced()
 
@@ -1015,6 +1664,8 @@ class TurboLauncherApp(tk.Tk):
                 var.set(str(value))
         self._gpu_layers_changed(str(self.vars["GpuLayers"].get()))
         self.update_vram_estimate()
+        self._update_command_preview()
+        self._update_warning_notes()
         if persist:
             self.save_session_debounced()
 
@@ -1028,6 +1679,9 @@ class TurboLauncherApp(tk.Tk):
         if self._loading:
             return
         self.update_vram_estimate()
+        self._update_chat_endpoint_preview()
+        self._update_command_preview()
+        self._update_warning_notes()
         self.save_session_debounced()
 
     def _gpu_layers_changed(self, value: str) -> None:
@@ -1039,9 +1693,61 @@ class TurboLauncherApp(tk.Tk):
         if not self._loading:
             self.update_vram_estimate()
 
+    def _model_transformer_layers(self, model: ModelEntry | None = None) -> int:
+        model = model or self.selected_model
+        if model and model.transformer_layers:
+            return max(1, int(model.transformer_layers))
+        return 40
+
+    def _model_full_offload_layers(self, model: ModelEntry | None = None) -> int | None:
+        model = model or self.selected_model
+        if model and model.full_offload_layers:
+            return max(0, int(model.full_offload_layers))
+        return None
+
+    def _update_gpu_offload_controls(self, model: ModelEntry | None = None) -> None:
+        model = model or self.selected_model
+        full_count = self._model_full_offload_layers(model)
+        current = int(float(self.vars["GpuLayers"].get() or 0))
+        if self.gpu_layers_scale is not None:
+            max_layers = max(full_count or 40, current, 40)
+            self.gpu_layers_scale.configure(to=max_layers)
+        if self.full_offload_button is not None:
+            if full_count is not None:
+                self.full_offload_button.configure(state="normal", text=f"Full offload ({full_count})")
+            else:
+                self.full_offload_button.configure(state="disabled", text="Full offload")
+        if full_count is not None:
+            self.gpu_offload_help_var.set(
+                f"Layer count passed to llama.cpp. Full offload for this model is {full_count}."
+            )
+        else:
+            self.gpu_offload_help_var.set(
+                "Layer count passed to llama.cpp. Full offload includes output layers when model metadata provides it."
+            )
+
+    def set_full_offload_layers(self) -> None:
+        full_count = self._model_full_offload_layers()
+        if full_count is None:
+            return
+        self.vars["GpuLayers"].set(float(full_count))
+        self._gpu_layers_changed(str(full_count))
+        self.on_setting_changed()
+
     def update_vram_estimate(self) -> None:
         settings = self.collect_settings(strict=False)
-        model_path = self.selected_model.path if self.selected_model else None
+        if not self.selected_model:
+            self.metric_vars["vram"].set("--")
+            self.metric_vars["vram_detail"].set("Select a model to estimate VRAM.")
+            self.vram_bar.configure(maximum=1.0, value=0)
+            if self.model_context_vars:
+                self._update_model_context(None)
+            if hasattr(self, "warning_text"):
+                self._update_warning_notes()
+            return
+
+        model_path = self.selected_model.path
+        self.total_layers = self._model_transformer_layers(self.selected_model)
         quant = (
             self.selected_model.quant
             if self.selected_model
@@ -1070,6 +1776,8 @@ class TurboLauncherApp(tk.Tk):
         )
         if self.selected_model and self.model_context_vars:
             self._update_model_context(self.selected_model)
+        if hasattr(self, "warning_text"):
+            self._update_warning_notes()
 
     def _context_presets_for_model(self, model: ModelEntry | None) -> list[str]:
         current = str(self.vars["CtxSize"].get())
@@ -1099,6 +1807,7 @@ class TurboLauncherApp(tk.Tk):
 
     def _update_model_context(self, model: ModelEntry | None = None) -> None:
         model = model or self.selected_model
+        self._update_gpu_offload_controls(model)
         ctx_values = self._context_presets_for_model(model)
         ctx_widget = self.setting_widgets.get("CtxSize")
         if isinstance(ctx_widget, ttk.Combobox):
@@ -1115,7 +1824,7 @@ class TurboLauncherApp(tk.Tk):
             self.model_context_vars["Quant"].set("--")
             self.model_context_vars["Source"].set("--")
             self.model_context_vars["Suggestion"].set(
-                "Pick a model in Models → Library to see file details, quant hints, and launch guidance."
+                "Pick a model in Models → Library to see file details, quant hints, and the live command preview."
             )
             return
 
@@ -1130,6 +1839,9 @@ class TurboLauncherApp(tk.Tk):
 
         suggested_ctx = ", ".join(ctx_values[:3])
         size_note = self._estimated_model_tier(model)
+        offload_note = ""
+        if model.full_offload_layers is not None:
+            offload_note = f" Full offload count: {model.full_offload_layers}."
         vram_preview = calculate_total_vram(
             model.path,
             quant,
@@ -1142,7 +1854,7 @@ class TurboLauncherApp(tk.Tk):
             self.total_layers,
         )
         self.model_context_vars["Suggestion"].set(
-            f"{size_note}. Suggested contexts: {suggested_ctx}. Current launch estimate: {vram_preview['TotalVRAMGB']:.2f} GB total, {vram_preview['RemainingGB']:+.2f} GB headroom."
+            f"{size_note}.{offload_note} Suggested contexts: {suggested_ctx}. Current launch estimate: {vram_preview['TotalVRAMGB']:.2f} GB total, {vram_preview['RemainingGB']:+.2f} GB headroom."
         )
 
     def _sync_library_selection(self) -> None:
@@ -1159,19 +1871,7 @@ class TurboLauncherApp(tk.Tk):
 
     @staticmethod
     def can_bind_port(host: str, port: int) -> tuple[bool, str]:
-        bind_host = str(host or "127.0.0.1").strip()
-        if bind_host in {"*", "[::]"}:
-            bind_host = "::"
-        elif not bind_host:
-            bind_host = "127.0.0.1"
-        family = socket.AF_INET6 if ":" in bind_host and bind_host.count(".") != 3 else socket.AF_INET
-        try:
-            with socket.socket(family, socket.SOCK_STREAM) as sock:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((bind_host, int(port)))
-            return True, ""
-        except OSError as exc:
-            return False, str(exc)
+        return LauncherService.can_bind_port(host, port)
 
     def save_session_debounced(self) -> None:
         if self._loading:
@@ -1187,6 +1887,7 @@ class TurboLauncherApp(tk.Tk):
             self.core.save_session(
                 self.current_preset, model_path, self.collect_settings(strict=False)
             )
+            self._store_chat_model_state()
         except Exception as exc:
             self.log(f"[WARN] Failed to save session: {exc}")
 
@@ -1245,25 +1946,29 @@ class TurboLauncherApp(tk.Tk):
             return
         self.core.set_runtime_path(path)
         self.log(f"Runtime path set: {path}")
+        self._update_warning_notes()
+        self._update_command_preview()
 
     def export_command(self) -> None:
-        if not self.selected_model:
-            messagebox.showwarning(
-                "Export command", "Select a model first.", parent=self
-            )
-            return
-        exe = self.core.resolve_runtime_executable() or Path("llama-server.exe")
-        try:
-            args = build_command_args(
-                self.selected_model.path, self.collect_settings(strict=True)
-            )
-        except ValueError as exc:
-            messagebox.showerror("Invalid setting", str(exc), parent=self)
-            return
-        cmd = command_string(exe, args)
+        cmd = self._format_launch_command()
         self.clipboard_clear()
         self.clipboard_append(cmd)
         self.log("Command copied to clipboard.")
+        if self.selected_model:
+            try:
+                request = LaunchRequest(
+                    executable_path=self.core.resolve_runtime_executable()
+                    or Path("llama-server.exe"),
+                    model_path=self.selected_model.path,
+                    settings=self.collect_settings(strict=True),
+                )
+                args = build_command_args(self.selected_model.path, self.collect_settings(strict=True))
+                args = self._augment_server_args_with_chat(args)
+                redacted = self.launcher_service.build_launch_command(request, args).redacted_command_text
+                self.log(redacted)
+                return
+            except Exception:
+                pass
         self.log(cmd)
 
     def start_server(self) -> None:
@@ -1287,6 +1992,7 @@ class TurboLauncherApp(tk.Tk):
         try:
             settings = self.collect_settings(strict=True)
             server_args = build_command_args(self.selected_model.path, settings)
+            server_args = self._augment_server_args_with_chat(server_args)
         except ValueError as exc:
             messagebox.showerror("Invalid setting", str(exc), parent=self)
             return
@@ -1301,9 +2007,13 @@ class TurboLauncherApp(tk.Tk):
                 parent=self,
             )
             return
-
-        cmd_list = [str(exe), *args_to_list(server_args)]
-        cmd_string = command_string(exe, server_args)
+        request = LaunchRequest(
+            executable_path=exe,
+            model_path=self.selected_model.path,
+            settings=settings,
+            cwd=exe.parent,
+        )
+        command = self.launcher_service.build_launch_command(request, server_args)
         self.log("")
         self.log("Starting llama-server...")
         self.log(f"Model: {self.selected_model.path}")
@@ -1317,33 +2027,21 @@ class TurboLauncherApp(tk.Tk):
         )
         self.log(f"Port: {settings['Port']} | Host: {settings['Host']}")
         self.log(f"Executable: {exe}")
-        self.log(f"Command: {cmd_string}")
+        self.log(f"Command: {command.redacted_command_text}")
         self.log("")
 
-        flags = (
-            subprocess.CREATE_NO_WINDOW
-            if hasattr(subprocess, "CREATE_NO_WINDOW")
-            else 0
-        )
         try:
-            self.process = subprocess.Popen(
-                cmd_list,
-                cwd=str(exe.parent),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=flags,
-            )
+            result = self.launcher_service.start_process(request, server_args)
+            self.running_process = result.running_process
+            self.process = result.running_process.process
         except Exception as exc:
+            self.running_process = None
             self.process = None
             self.set_status("Failed", "red")
             self.log(f"[ERROR] Failed to start llama-server: {exc}")
             return
 
-        self.server_start_time = time.time()
+        self.server_start_time = result.started_at
         self.running_host = settings["Host"]
         self.running_port = settings["Port"]
         self.set_status("Running", "green")
@@ -1353,6 +2051,7 @@ class TurboLauncherApp(tk.Tk):
         self.after(2000, self.poll_metrics)
         self.after(1000, self.poll_resources)
         self.save_current_session()
+        self._update_warning_notes()
 
     def stop_server(self) -> None:
         self.log("")
@@ -1376,22 +2075,41 @@ class TurboLauncherApp(tk.Tk):
             urllib.request.urlopen(request, timeout=2).close()
         except Exception:
             pass
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:
+        if self.running_process is not None:
+            self.launcher_service.stop_process(self.running_process)
+        else:
             try:
-                proc.kill()
+                proc.terminate()
                 proc.wait(timeout=3)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+        self.running_process = None
         self.process = None
         self.server_start_time = None
         self.running_host = None
         self.running_port = None
         self.set_status("Stopped", "muted")
         self.metric_vars["uptime"].set("--")
+        for key in [
+            "context",
+            "kv_cache",
+            "requests",
+            "requests_active",
+            "requests_queued",
+            "session_slot",
+            "session_progress",
+            "prompt_progress",
+            "prompt_processed",
+            "session_decoded",
+            "session_remaining",
+        ]:
+            self.metric_vars[key].set("--")
         self.log("Server stopped.")
+        self._update_warning_notes()
 
     def _read_process_output(self) -> None:
         proc = self.process
@@ -1430,6 +2148,20 @@ class TurboLauncherApp(tk.Tk):
         self.running_port = None
         self.set_status(f"Exited ({code})", "muted")
         self.metric_vars["uptime"].set("--")
+        for key in [
+            "context",
+            "kv_cache",
+            "requests",
+            "requests_active",
+            "requests_queued",
+            "session_slot",
+            "session_progress",
+            "prompt_progress",
+            "prompt_processed",
+            "session_decoded",
+            "session_remaining",
+        ]:
+            self.metric_vars[key].set("--")
 
     def poll_metrics(self) -> None:
         if not self.process or self.process.poll() is not None:
@@ -1442,12 +2174,12 @@ class TurboLauncherApp(tk.Tk):
             "Port", 1234
         )
         try:
-            with urllib.request.urlopen(
-                f"http://{host}:{port}/metrics", timeout=2
-            ) as response:
-                content = response.read().decode("utf-8", errors="replace")
-            metrics = parse_prometheus_metrics(content)
-            self.update_metrics(metrics)
+            snapshot = self.monitoring_service.collect_monitoring_snapshot(host, int(port))
+            if snapshot.ui_metrics:
+                self.update_metrics(snapshot.ui_metrics)
+            self.update_slot_metrics(
+                snapshot.slot_state.to_ui_metrics() if snapshot.slot_state else {}
+            )
         except Exception:
             pass
         self.after(2000, self.poll_metrics)
@@ -1455,22 +2187,19 @@ class TurboLauncherApp(tk.Tk):
     def poll_resources(self) -> None:
         if not self.process or self.process.poll() is not None:
             return
-        cpu = get_cpu_usage()
-        if cpu is not None:
-            self.metric_vars["cpu"].set(f"{cpu:.0f}%")
-        ram = get_ram_usage()
-        if ram:
-            self.metric_vars["ram"].set(
-                f"{ram['UsedGB']} / {ram['TotalGB']} GB ({ram['Percent']:.0f}%)"
-            )
-        gpu = get_gpu_info()
-        if gpu:
-            self.metric_vars["gpu"].set(f"{gpu['Utilization']:.0f}%")
-            self.metric_vars["gpu_vram"].set(
-                f"{gpu['UsedVramGB']} / {gpu['TotalVramGB']} GB"
-            )
-            if gpu.get("TotalVramGB"):
-                self.available_vram = float(gpu["TotalVramGB"])
+        resource_usage = self.monitoring_service.fetch_local_resource_usage()
+        if resource_usage:
+            resource_metrics = resource_usage.to_ui_metrics()
+            if "cpu" in resource_metrics:
+                self.metric_vars["cpu"].set(resource_metrics["cpu"])
+            if "ram" in resource_metrics:
+                self.metric_vars["ram"].set(resource_metrics["ram"])
+            if "gpu" in resource_metrics:
+                self.metric_vars["gpu"].set(resource_metrics["gpu"])
+            if "gpu_vram" in resource_metrics:
+                self.metric_vars["gpu_vram"].set(resource_metrics["gpu_vram"])
+            if resource_usage.gpu_total_vram_gb:
+                self.available_vram = float(resource_usage.gpu_total_vram_gb)
                 self.update_vram_estimate()
         self.after(3000, self.poll_resources)
 
@@ -1478,7 +2207,7 @@ class TurboLauncherApp(tk.Tk):
         if "tps" in metrics:
             self.metric_vars["tps"].set(f"{metrics['tps']:.1f} tok/s")
         if "peps" in metrics:
-            self.metric_vars["peps"].set(f"{metrics['peps']:.1f}")
+            self.metric_vars["peps"].set(f"{metrics['peps']:.1f} tok/s")
         if (
             "total_decode_time" in metrics
             and "total_decode_tokens" in metrics
@@ -1493,26 +2222,139 @@ class TurboLauncherApp(tk.Tk):
         ):
             ms = (metrics["total_prompt_time"] / metrics["total_prompt_tokens"]) * 1000
             self.metric_vars["prompt_time"].set(f"{ms:.1f}")
-        if "ctx_size" in metrics:
-            self.metric_vars["context"].set(f"/ {metrics['ctx_size']} tokens")
+        ctx_capacity = metrics.get("slot_ctx") or self.collect_settings(strict=False).get(
+            "CtxSize", 0
+        )
+        if "kv_cache_tokens" in metrics:
+            self.metric_vars["context"].set(
+                f"{int(metrics['kv_cache_tokens']):,} / {int(ctx_capacity):,} tokens"
+            )
+        elif "ctx_size" in metrics:
+            self.metric_vars["context"].set(
+                f"{int(metrics['ctx_size']):,} / {int(ctx_capacity):,} peak"
+            )
         if "kv_usage" in metrics:
-            self.metric_vars["kv_cache"].set(f"{metrics['kv_usage']:.1f}")
+            self.metric_vars["kv_cache"].set(f"{metrics['kv_usage'] * 100:.0f}%")
         if "total_decode_tokens" in metrics:
             self.metric_vars["tokens"].set(f"{metrics['total_decode_tokens']:,}")
+        if "total_prompt_tokens" in metrics:
+            self.metric_vars["prompt_tokens"].set(f"{metrics['total_prompt_tokens']:,}")
         if "requests" in metrics:
             self.metric_vars["requests"].set(str(metrics["requests"]))
+        if "requests_processing" in metrics:
+            self.metric_vars["requests_active"].set(str(metrics["requests_processing"]))
+        if "requests_deferred" in metrics:
+            self.metric_vars["requests_queued"].set(str(metrics["requests_deferred"]))
+        if "total_prompt_tokens" in metrics and self.metric_vars["prompt_processed"].get() == "--":
+            self.metric_vars["prompt_processed"].set(f"{metrics['total_prompt_tokens']:,}")
+
+    def update_slot_metrics(self, slot_metrics: dict[str, Any]) -> None:
+        if not slot_metrics:
+            self.metric_vars["session_slot"].set("--")
+            self.metric_vars["session_progress"].set("--")
+            self.metric_vars["session_decoded"].set("--")
+            self.metric_vars["session_remaining"].set("--")
+            return
+        slot_id = slot_metrics.get("slot_id")
+        task_id = slot_metrics.get("task_id")
+        processing = slot_metrics.get("slot_processing")
+        if slot_id is not None:
+            label = f"slot {slot_id}"
+            if task_id is not None:
+                label += f" · task {task_id}"
+            if processing:
+                label += " · active"
+            self.metric_vars["session_slot"].set(label)
+        if slot_metrics.get("slot_ctx"):
+            current = self.metric_vars["context"].get()
+            if "/" not in current or current.endswith("peak"):
+                self.metric_vars["context"].set(f"-- / {int(slot_metrics['slot_ctx']):,} tokens")
+        if "session_progress" in slot_metrics:
+            self.metric_vars["session_progress"].set(
+                f"{slot_metrics['session_progress'] * 100:.0f}%"
+            )
+        elif slot_metrics.get("slot_processing"):
+            self.metric_vars["session_progress"].set("running")
+        else:
+            self.metric_vars["session_progress"].set("--")
+        if "session_decoded" in slot_metrics:
+            self.metric_vars["session_decoded"].set(
+                f"{int(slot_metrics['session_decoded']):,}"
+            )
+        if "session_remaining" in slot_metrics:
+            self.metric_vars["session_remaining"].set(
+                f"{int(slot_metrics['session_remaining']):,}"
+            )
 
     def set_status(self, text: str, color_key: str) -> None:
         self.metric_vars["status"].set(text)
         color = self.COLORS.get(color_key, self.COLORS["muted"])
         self.status_dot.configure(foreground=color)
+        if hasattr(self, "status_value_label"):
+            self.status_value_label.configure(foreground=color)
+
+    def _format_launch_command(self) -> str:
+        if not self.selected_model:
+            return "Select a model to generate the launch command."
+        exe = self.core.resolve_runtime_executable() or Path("llama-server.exe")
+        try:
+            args = build_command_args(self.selected_model.path, self.collect_settings(strict=True))
+            args = self._augment_server_args_with_chat(args)
+        except Exception:
+            try:
+                args = build_command_args(self.selected_model.path, self.collect_settings(strict=False))
+                args = self._augment_server_args_with_chat(args)
+            except Exception as exc:
+                return f"Command preview unavailable: {exc}"
+        return command_string(exe, args)
+
+    def _update_command_preview(self) -> None:
+        if not self.command_preview_text:
+            return
+        command = self._format_launch_command()
+        self.command_preview_text.configure(state="normal")
+        self.command_preview_text.delete("1.0", "end")
+        self.command_preview_text.insert("1.0", command)
+        self.command_preview_text.configure(state="disabled")
+
+    def _update_warning_notes(self) -> None:
+        if not self.warning_text:
+            return
+        notes: list[str] = []
+        if not self.selected_model:
+            notes.append("No model selected yet. Pick one to unlock launching and live endpoint monitoring.")
+        if not self.core.resolve_runtime_executable():
+            notes.append("llama-server.exe is not configured. Use Runtime to set the executable path.")
+        if self.selected_model and self.metric_vars["vram"].get() not in {"--", "", None}:
+            try:
+                total = float(self.metric_vars["vram"].get().split()[0])
+                if total > self.available_vram:
+                    notes.append(f"Estimated VRAM exceeds detected capacity by {total - self.available_vram:.2f} GB.")
+            except Exception:
+                pass
+        if self.selected_model:
+            full_count = self._model_full_offload_layers(self.selected_model)
+            try:
+                current_layers = int(float(self.vars["GpuLayers"].get() or 0))
+            except Exception:
+                current_layers = 0
+            if full_count is not None:
+                if current_layers < full_count:
+                    notes.append(
+                        f"Partial GPU offload selected ({current_layers}/{full_count}). Some layers or output tensors may remain on CPU."
+                    )
+                else:
+                    notes.append(f"Full GPU offload selected ({full_count}/{full_count}).")
+        notes.append("Chat settings are stored per model and remain hidden until you open the Chat tab.")
+        notes.append("The generated command updates live as you change model, preset, and runtime settings.")
+        self.warning_text.configure(state="normal")
+        self.warning_text.delete("1.0", "end")
+        self.warning_text.insert("1.0", "\n\n".join(f"• {note}" for note in notes))
+        self.warning_text.configure(state="disabled")
 
     @staticmethod
     def local_poll_host(host: str) -> str:
-        host = str(host or "127.0.0.1").strip()
-        if host in {"0.0.0.0", "::", "[::]", "*"}:
-            return "127.0.0.1"
-        return host
+        return LauncherService.normalize_poll_host(host)
 
     def log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1607,15 +2449,16 @@ class TurboLauncherApp(tk.Tk):
 
         self.models_library_list = tk.Listbox(
             frame,
-            bg="#0b1220",
+            bg=self.COLORS["surface2"],
             fg=self.COLORS["text"],
-            selectbackground="#0ea5e9",
-            selectforeground="#001018",
+            selectbackground=self.COLORS["accent"],
+            selectforeground="#08111f",
             activestyle="none",
             highlightthickness=1,
-            highlightbackground="#334155",
+            highlightbackground=self.COLORS["line"],
             relief="flat",
             font=self.BODY_FONT,
+            exportselection=False,
         )
         self.models_library_list.grid(row=1, column=0, sticky="nsew", padx=12)
         self.models_library_list.bind("<<ListboxSelect>>", self._on_library_selected)
@@ -1649,7 +2492,7 @@ class TurboLauncherApp(tk.Tk):
             ).grid(row=row, column=1, sticky="nw", padx=10, pady=6)
         ttk.Label(
             details,
-            text="Pick a model here to populate the Launch workspace.",
+            text="Pick a model here to populate the Overview and command preview.",
             style="Panel.TLabel",
             foreground=self.COLORS["muted"],
             wraplength=420,
@@ -1670,10 +2513,17 @@ class TurboLauncherApp(tk.Tk):
         self.download_models_list = tk.Listbox(
             frame,
             height=8,
-            bg="#0b1220",
+            bg=self.COLORS["surface2"],
             fg=self.COLORS["text"],
-            selectbackground="#0ea5e9",
-            selectforeground="#001018",
+            selectbackground=self.COLORS["accent"],
+            selectforeground="#08111f",
+            activestyle="none",
+            highlightthickness=1,
+            highlightbackground=self.COLORS["line"],
+            relief="flat",
+            borderwidth=0,
+            font=self.BODY_FONT,
+            exportselection=False,
         )
         self.download_models_list.grid(row=0, column=0, sticky="nsew", padx=12, pady=8)
         download_scroll = ttk.Scrollbar(
@@ -1726,10 +2576,17 @@ class TurboLauncherApp(tk.Tk):
         frame.rowconfigure(0, weight=1)
         self.sources_list = tk.Listbox(
             frame,
-            bg="#0b1220",
+            bg=self.COLORS["surface2"],
             fg=self.COLORS["text"],
-            selectbackground="#0ea5e9",
-            selectforeground="#001018",
+            selectbackground=self.COLORS["accent"],
+            selectforeground="#08111f",
+            activestyle="none",
+            highlightthickness=1,
+            highlightbackground=self.COLORS["line"],
+            relief="flat",
+            borderwidth=0,
+            font=self.BODY_FONT,
+            exportselection=False,
         )
         self.sources_list.grid(row=0, column=0, sticky="nsew", padx=12, pady=8)
         sources_scroll = ttk.Scrollbar(
