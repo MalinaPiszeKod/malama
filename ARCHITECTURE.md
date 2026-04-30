@@ -1,197 +1,99 @@
-# Malina's Llama Launcher Architecture
+# malama Architecture
 
 ## Overview
 
-Malina's Llama Launcher is a local launcher and control surface for `llama-server` / `llama.cpp` compatible backends on Windows-first environments.
+`malama - Malina's Llama Launcher` is an Electron + TypeScript desktop control surface for local `llama-server` / `llama.cpp` workflows.
 
-The refactored architecture keeps behavior stable while separating pure domain logic, persistence, process management, and UI orchestration.
+Electron is the only supported application path. Legacy Python, Tkinter, and PowerShell launchers have been removed.
 
 ## Module layout
 
-### UI and composition
+### Main process
 
-- `turbolauncher/app.py`
-  - Tkinter window and widgets
-  - event handlers
-  - schedules polling / threads
-  - delegates launcher/config/model/session work to services
+- `src/main/index.ts` boots Electron, creates services, registers IPC, and opens the main window.
+- `src/main/createWindow.ts` configures the browser window and preload script.
+- `src/main/AppPaths.ts` centralizes project, asset, and user-data paths.
+- `src/main/SettingsService.ts` loads, saves, and resets `llama-server` settings.
+- `src/main/ModelService.ts` loads presets, registry entries, GGUF files, and model config metadata.
+- `src/main/LauncherService.ts` owns `llama-server.exe` path persistence plus process start/stop state.
+- `src/main/ChatService.ts` calls the OpenAI-compatible local chat API and persists sessions.
+- `src/main/MetricsService.ts` collects launcher and host metrics snapshots.
+- `src/main/HuggingFaceService.ts` searches Hugging Face model data.
+- `src/main/ipc.ts` exposes typed IPC handlers.
 
-### Domain and pure logic
+### Preload
 
-- `turbolauncher/settings.py`
-  - defaults
-  - coercion
-  - validation ranges and enums
-- `turbolauncher/command_builder.py`
-  - central llama-server flag generation
-  - command argument ordering
-- `turbolauncher/models.py`
-  - `ModelEntry`
-  - `.cfg` parsing helpers
-  - GGUF quant/file metadata
-- `turbolauncher/monitoring.py`
-  - Prometheus metrics parsing
-  - `/slots` parsing
-  - OS resource probes
-- `turbolauncher/vram.py`
-  - VRAM estimation heuristics
-- `turbolauncher/chat.py`
-  - OpenAI-compatible `/v1/models` and streaming chat helpers
+- `src/preload/index.ts` exposes the safe `window.malama` API through Electron context isolation.
 
-### Services
+### Shared domain
 
-- `turbolauncher/services/model_service.py`
-  - model registry
-  - source folders
-  - `.gguf` discovery
-  - `.cfg` resolution and metadata merge
-- `turbolauncher/services/preset_service.py`
-  - preset listing/loading/saving
-- `turbolauncher/services/session_service.py`
-  - session persistence
-- `turbolauncher/services/runtime_service.py`
-  - runtime path resolution
-- `turbolauncher/services/launcher_service.py`
-  - launch request validation
-  - bind host / poll host normalization
-  - subprocess start / stop
-  - redacted command logging
+- `src/shared/types.ts` defines app, model, preset, metrics, chat, and settings types.
+- `src/shared/defaults.ts` defines default `llama-server` settings and presets.
+- `src/shared/parsers.ts` parses model registry/config formats.
+- `src/shared/commandBuilder.ts` centralizes `llama-server` command argument generation.
+- `src/shared/ipc.ts` defines IPC channel names and API contracts.
 
-### Infrastructure
+### Renderer
 
-- `turbolauncher/infrastructure/json_store.py`
-  - shared JSON read/write helpers
+- `src/renderer/index.ts` owns renderer state wiring and action dispatch.
+- `src/renderer/app.ts` renders the top-level shell and root view routing.
+- `src/renderer/components.ts` contains reusable DOM component helpers.
+- `src/renderer/views/` contains Deploy, Library, Chat, Settings, and Metrics views.
+- `src/renderer/styles/theme.css` contains theme tokens and component primitives.
+- `src/renderer/styles/layout.css` contains app layout and responsive view structure.
 
-### Compatibility facade
+## Configuration and data
 
-- `turbolauncher/core.py`
-  - stable `LauncherCore` wrapper around service modules
-  - preserves older import and call sites
+The app preserves existing data assets:
 
-## Configuration model
+- `resources/images/logo.png`
+- `models.registry`
+- `model-configs/*.cfg`
+- `presets/*.json`
+- `docs/`
 
-### Presets
+User runtime state is stored in Electron's user-data directory through `AppPaths`, including:
 
-Presets remain JSON files in `presets/*.json`.
-
-Example:
-
-```json
-{
-  "Name": "Balanced",
-  "Description": "General-purpose interactive preset",
-  "Created": "2026-04-29 12:00",
-  "Settings": {
-    "GpuLayers": 30,
-    "CtxSize": 65536,
-    "Threads": 16,
-    "CacheTypeK": "turbo3",
-    "CacheTypeV": "turbo3"
-  }
-}
-```
-
-### Model registry
-
-Model registry format is unchanged:
-
-```ini
-# Model registry - alias=config_path
-qwen36=model-configs/qwen36.cfg
-demo_model=D:\Models\demo.gguf
-```
-
-### Model config
-
-Model `.cfg` files remain backward-compatible. They can optionally provide offload metadata and chat metadata.
-
-Example:
-
-```ini
-MODEL_PATH=D:\Models\demo.gguf
-ALIAS=demo
-HOST=127.0.0.1
-PORT=1234
-
-TRANSFORMER_LAYERS=40
-OUTPUT_LAYER=on
-FULL_OFFLOAD_LAYERS=41
-
-CHAT_SYS_PROMPT=You are a helpful assistant.
-CHAT_TEMPLATE={{ bos_token }}{{ messages }}
-```
-
-Offload metadata precedence:
-
-1. `FULL_OFFLOAD_LAYERS`
-2. `TRANSFORMER_LAYERS + OUTPUT_LAYER`
-3. unknown / unset
-
-### Runtime state
-
-User runtime state remains separate from presets:
-
-- `%APPDATA%/TurboLauncher/session.json`
-- `%APPDATA%/TurboLauncher/chat_state.json`
-- `%APPDATA%/TurboLauncher/runtime_path.txt`
-- `%APPDATA%/TurboLauncher/model_library.json`
+- `settings.json`
+- `launcher.json`
+- `chat-sessions.json`
 
 ## Command generation
 
-All llama-server flags should be added in exactly one place:
+All `llama-server` CLI flags should be added in one place:
 
-- `turbolauncher/command_builder.py`
+- `src/shared/commandBuilder.ts`
 
-To add a new flag:
+To add a new setting:
 
-1. add default and type in `settings.py`
-2. add validation if needed in `settings.py`
-3. map the option to its CLI flag in `command_builder.py`
-4. add regression tests in `tests/test_regressions.py`
+1. add the field/type in `src/shared/types.ts`
+2. add its default in `src/shared/defaults.ts`
+3. map it to CLI arguments in `src/shared/commandBuilder.ts`
+4. expose or edit it in `src/renderer/views/settings.ts` or the relevant deploy settings panel
+5. keep IPC payloads typed through `src/shared/ipc.ts`
 
-## Backend / fork extensibility
+## UI architecture
 
-The launcher currently preserves a single canonical flag builder for llama.cpp-compatible backends.
+Views should stay modular and styling should remain customizable through CSS variables/classes. User-facing UI belongs under `src/renderer/views/`; shared primitives belong in `src/renderer/components.ts`.
 
-To add support for a backend or fork:
+## Security notes
 
-1. keep shared options in `settings.py`
-2. add backend-specific argument mapping in `command_builder.py`
-3. if divergence grows, introduce a small backend selector in a new module such as:
-   - `turbolauncher/backends.py`
-4. keep unsupported combinations validated early with actionable errors
+- Renderer code talks to the main process only through `window.malama`.
+- `contextIsolation` is enabled and `nodeIntegration` is disabled.
+- Secrets and full API keys must not be logged.
+- UI logs should display redacted command text where applicable.
 
-Do not fork flag generation across the UI.
+## Validation
 
-## Logging and secrets
+Use:
 
-Secrets such as API keys must never be logged directly.
+```powershell
+npm run typecheck
+npm run build
+```
 
-- `LauncherService.build_launch_command()` produces both:
-  - full command text
-  - redacted command text
+Optional packaging smoke test:
 
-UI logs should use the redacted form.
-
-## Known limitations / technical debt
-
-- `app.py` is still the largest file and remains the main composition root.
-- Tkinter widget construction is still co-located with many event handlers.
-- monitoring is split between server metrics, `/slots`, and chat-stream progress; external non-launcher requests cannot provide full prompt progress.
-- backend/fork-specific behavior is prepared for extension but not yet split into dedicated backend modules.
-- legacy PowerShell/WPF assets still exist alongside the Python launcher.
-
-## Testing strategy
-
-Current regression coverage focuses on:
-
-- config defaults and compatibility
-- model config parsing and offload metadata
-- registry and duplicate handling
-- command building
-- Windows path quoting / paths with spaces
-- API key redaction
-- invalid configuration errors
-- launcher process stop behavior using mocks
-- metrics and slots parsing
-- chat SSE and prompt-progress event handling
+```powershell
+npm run package
+```

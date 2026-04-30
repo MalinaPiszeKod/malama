@@ -12,5 +12,8 @@ venv/
 
 dist/
 build/
+release/
+node_modules/
+*.tsbuildinfo
 
 *.log

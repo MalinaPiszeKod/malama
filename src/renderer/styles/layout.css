@@ -1,0 +1,46 @@
+.app-shell { width: 100vw; height: 100vh; display: grid; grid-template-rows: 72px 1fr; }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 18px; border-bottom: 1px solid var(--border); background: rgba(7, 12, 24, 0.62); }
+.brand { display: flex; align-items: center; gap: 12px; }
+.nav-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+.nav.active { background: rgba(124, 156, 255, 0.18); }
+.content { padding: 16px; overflow: auto; height: calc(100vh - 72px); min-height: 0; }
+.view-grid { display: grid; grid-template-columns: minmax(280px, 300px) minmax(0, 1fr) minmax(280px, 320px); gap: 16px; }
+.library-view, .deploy-view { min-height: calc(100vh - 104px); }
+.settings-layout, .metrics-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 320px); gap: 16px; }
+.chat-layout { display: grid; grid-template-columns: minmax(240px, 280px) minmax(0, 1fr); gap: 16px; min-height: calc(100vh - 104px); }
+.chat-sidebar, .chat-main { padding: 14px; display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+.chat-messages { display: flex; flex-direction: column; gap: 12px; overflow: auto; flex: 1; min-height: 0; }
+.chat-message { border: 1px solid var(--border); border-radius: 14px; padding: 12px; background: rgba(255,255,255,0.03); }
+.chat-message.user { border-color: rgba(124,156,255,0.32); }
+.chat-message.assistant { border-color: rgba(61,220,151,0.26); }
+.chat-role { font-size: .76rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 8px; }
+.chat-content { white-space: pre-wrap; line-height: 1.55; }
+.chat-footer { display: flex; gap: 8px; flex-wrap: wrap; }
+.tree { display: flex; flex-direction: column; gap: 6px; }
+.tree-group { display: flex; flex-direction: column; gap: 6px; padding-left: 10px; border-left: 1px solid rgba(255,255,255,0.06); }
+.tree-row { width: 100%; text-align: left; border: 0; border-radius: 10px; background: rgba(255,255,255,0.03); color: var(--text); padding: 9px 10px; cursor: pointer; white-space: pre-wrap; }
+.tree-row.model.active { background: rgba(124, 156, 255, 0.18); }
+.tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+.tab.active { background: rgba(124, 156, 255, 0.18); }
+.metric-tile { padding: 14px; border-radius: 16px; border: 1px solid var(--border); background: rgba(255,255,255,0.03); display: flex; flex-direction: column; gap: 6px; }
+.metric-label { font-size: .78rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+.metric-value { font-size: 1.35rem; font-weight: 700; }
+.metric-detail { color: var(--muted); font-size: .88rem; }
+
+@media (max-width: 1200px) {
+  .app-shell { grid-template-rows: auto 1fr; }
+  .topbar { flex-direction: column; align-items: stretch; padding: 14px 18px; }
+  .brand { justify-content: flex-start; }
+  .nav-tabs { justify-content: flex-start; }
+  .content { height: auto; }
+  .view-grid, .settings-layout, .metrics-layout, .chat-layout { grid-template-columns: minmax(0, 1fr); }
+  .library-view, .deploy-view, .chat-layout { min-height: auto; }
+}
+
+@media (max-width: 720px) {
+  .content { padding: 12px; }
+  .kv-grid { grid-template-columns: 1fr; }
+  .button-row, .search-row, .chat-footer { flex-direction: column; align-items: stretch; }
+  .button, .field-input, .tabs .button { width: 100%; }
+  .card, .panel { border-radius: 14px; }
+}

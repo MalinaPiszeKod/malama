@@ -1,0 +1,45 @@
+{
+  "name": "turbolauncher-electron",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Electron + TypeScript launcher for llama-server workflows.",
+  "main": "dist/main/main/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true});require('fs').rmSync('release',{recursive:true,force:true});\"",
+    "typecheck": "tsc -b --pretty false --noEmit",
+    "build": "tsc -b && node scripts/copy-static.cjs",
+    "start": "npm run build && electron .",
+    "dev": "npm run build && electron .",
+    "package": "npm run build && electron-builder"
+  },
+  "build": {
+    "appId": "com.malama.turbolauncher",
+    "productName": "malama - Malina's Llama Launcher",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "resources/**/*",
+      "model-configs/**/*",
+      "presets/**/*",
+      "models.registry",
+      "docs/**/*",
+      "README.md",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "target": ["nsis"]
+    }
+  },
+  "dependencies": {
+    "electron": "^32.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "electron-builder": "^24.13.3",
+    "typescript": "^5.8.3"
+  }
+}

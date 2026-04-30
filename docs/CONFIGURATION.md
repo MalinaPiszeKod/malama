@@ -1,8 +1,8 @@
 # Configuration
 
-This document describes the configuration files and runtime state used by Malina's Llama Launcher.
+This document describes the configuration files and runtime state used by `malama - Malina's Llama Launcher`.
 
-## File overview
+## Project data files
 
 ### Presets
 
@@ -21,7 +21,7 @@ Key fields:
 - `Created`
 - `Settings`
 
-The `Settings` object maps directly onto launcher options defined in `turbolauncher/settings.py`.
+The `Settings` object maps onto launcher options defined in `src/shared/types.ts` and defaulted in `src/shared/defaults.ts`.
 
 ### Model registry
 
@@ -77,33 +77,17 @@ Common keys:
 - `OUTPUT_LAYER`
 - `FULL_OFFLOAD_LAYERS`
 
-### Runtime state
+## Runtime state
 
-Location:
+Runtime state is stored in Electron's user-data directory, resolved by `src/main/AppPaths.ts`.
 
-- `%APPDATA%\TurboLauncher\session.json`
-- `%APPDATA%\TurboLauncher\runtime_path.txt`
-- `%APPDATA%\TurboLauncher\model_library.json`
-- `%APPDATA%\TurboLauncher\chat_state.json`
+Current files:
 
-Purpose:
-
-- stores current session, runtime path, model source folders, download directory, and chat state
+- `settings.json`
+- `launcher.json`
+- `chat-sessions.json`
 
 These are user/runtime state files, not committed project config.
-
-## Backward compatibility
-
-The launcher preserves compatibility with existing preset/session/config formats where possible.
-
-### Session compatibility
-
-`session.json` intentionally writes both:
-
-- legacy top-level keys such as `LastPreset` and `LastModel`
-- nested `Settings`
-
-This keeps older behavior stable while allowing newer code to consume structured settings.
 
 ## Offload metadata
 
@@ -123,17 +107,9 @@ The launcher supports generic model offload metadata in sidecar configs.
 
 If `OUTPUT_LAYER` is omitted and `TRANSFORMER_LAYERS` is present, the launcher assumes full offload includes one output layer unless explicitly disabled.
 
-## Source folders
-
-Source folders are stored in `model_library.json` under `source_dirs`.
-
-Default source directories are resolved generically through `turbolauncher/model_sources.py` and are no longer meant to live as machine-specific service internals.
-
-Environment override support can be added or adjusted there without changing discovery logic.
-
 ## Validation expectations
 
-The launcher validates early for:
+The launcher should validate early for:
 
 - missing runtime executable
 - missing model file
@@ -142,10 +118,11 @@ The launcher validates early for:
 - occupied port
 - unsupported flag combinations where known
 
-Validation entry points:
+Relevant implementation areas:
 
-- `turbolauncher/settings.py`
-- `turbolauncher/services/launcher_service.py`
+- `src/main/SettingsService.ts`
+- `src/main/LauncherService.ts`
+- `src/shared/commandBuilder.ts`
 
 ## Example model config
 
