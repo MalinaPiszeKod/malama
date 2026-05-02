@@ -12,7 +12,7 @@ Location:
 
 Purpose:
 
-- reusable launcher settings profiles
+- reusable launcher/model profiles
 
 Key fields:
 
@@ -21,7 +21,38 @@ Key fields:
 - `Created`
 - `Settings`
 
-The `Settings` object maps onto launcher options defined in `src/shared/types.ts` and defaulted in `src/shared/defaults.ts`.
+The `Settings` object maps onto typed options defined in `src/shared/types.ts` and defaulted in `src/shared/defaults.ts`. Server-global settings are stored separately from model profile settings.
+
+### Server settings
+
+Location:
+
+- Electron user-data `settings.json`
+
+Purpose:
+
+- global `llama-server.exe` process settings
+- host/port/API key
+- logging, metrics, batching, parallelism
+- multi-model repository mode
+- launcher health/startup behavior
+
+These settings are edited only from the app Settings tab.
+
+### Model profiles
+
+Location:
+
+- Electron user-data `settings.json` under `modelProfiles`
+- optional project sidecars in `model-configs/*.cfg`
+
+Purpose:
+
+- selected model identity and alias
+- model load/runtime overrides
+- inference, sampling, reasoning, and prompt defaults
+
+These settings are edited from the selected-model panel in Deploy.
 
 ### Model registry
 
@@ -54,18 +85,15 @@ Location:
 
 Purpose:
 
-- per-model metadata and defaults
+- per-model metadata and profile defaults
 - model path indirection
 - chat metadata
-- generic offload metadata
+- model-load/offload metadata
 
 Common keys:
 
 - `MODEL_PATH`
 - `ALIAS`
-- `HOST`
-- `PORT`
-- `THREADS`
 - `CTX_SIZE`
 - `CACHE_TYPE_K`
 - `CACHE_TYPE_V`
@@ -129,14 +157,10 @@ Relevant implementation areas:
 ```ini
 MODEL_PATH=D:\Models\demo.gguf
 ALIAS=demo
-HOST=127.0.0.1
-PORT=1234
-
 TRANSFORMER_LAYERS=40
 OUTPUT_LAYER=on
 FULL_OFFLOAD_LAYERS=41
 
-THREADS=16
 CTX_SIZE=65536
 CACHE_TYPE_K=turbo3
 CACHE_TYPE_V=turbo3

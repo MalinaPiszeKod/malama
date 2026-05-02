@@ -9,6 +9,7 @@
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true});require('fs').rmSync('release',{recursive:true,force:true});\"",
     "typecheck": "tsc -b --pretty false --noEmit",
     "build": "tsc -b && node scripts/copy-static.cjs",
+    "test": "npm run build && node --test tests/*.test.mjs",
     "start": "npm run build && electron .",
     "dev": "npm run build && electron .",
     "package": "npm run build && electron-builder"
@@ -34,11 +35,9 @@
       "target": ["nsis"]
     }
   },
-  "dependencies": {
-    "electron": "^32.2.7"
-  },
   "devDependencies": {
     "@types/node": "^22.13.10",
+    "electron": "^32.2.7",
     "electron-builder": "^24.13.3",
     "typescript": "^5.8.3"
   }

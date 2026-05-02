@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import type { ChatMessage, ChatSession, LlamaServerSettings } from '../shared/types';
+import type { ChatMessage, ChatSession, ModelProfileConfig, ServerSettings } from '../shared/types';
+import { buildRequestDefaults } from '../shared/commandBuilder';
 import type { AppPaths } from './AppPaths';
 import { JsonStore } from './JsonStore';
 
@@ -23,7 +24,7 @@ export class ChatService {
     return session;
   }
 
-  async sendMessage(sessionId: string | undefined, message: string, settings: LlamaServerSettings, modelId?: string): Promise<ChatSession> {
+  async sendMessage(sessionId: string | undefined, message: string, settings: ServerSettings, modelProfile?: Partial<ModelProfileConfig>, modelId?: string): Promise<ChatSession> {
     const sessions = await this.loadSessions();
     const session = sessions.find((item) => item.id === sessionId) ?? sessions[0] ?? this.createDefaultSession();
     const now = new Date().toISOString();
@@ -31,7 +32,7 @@ export class ChatService {
     session.updatedAt = now;
     if (!session.title || session.title === 'New chat') session.title = message.slice(0, 32) || 'Chat';
 
-    const assistant = await this.tryRemoteCompletion(session.messages, settings, modelId).catch(() => 'Remote server unavailable. This is an offline scaffold response. Configure a running llama-server instance to enable live chat.');
+    const assistant = await this.tryRemoteCompletion(session.messages, settings, modelProfile, modelId).catch(() => 'Remote server unavailable. This is an offline scaffold response. Configure a running llama-server instance to enable live chat.');
     session.messages.push({ id: id('assistant'), role: 'assistant', content: assistant, createdAt: new Date().toISOString() });
     await this.saveSession(session);
     return session;
@@ -42,13 +43,12 @@ export class ChatService {
     return { id: id('chat'), title: 'New chat', updatedAt: now, messages: [{ id: id('system'), role: 'system', content: 'You are a helpful assistant.', createdAt: now }] };
   }
 
-  private async tryRemoteCompletion(messages: ChatMessage[], settings: LlamaServerSettings, modelId?: string): Promise<string> {
+  private async tryRemoteCompletion(messages: ChatMessage[], settings: ServerSettings, modelProfile: Partial<ModelProfileConfig> = {}, modelId?: string): Promise<string> {
     const body = {
-      model: modelId || settings.Alias || 'local-model',
+      model: modelProfile.Alias || modelId || 'local-model',
       messages: messages.map((msg) => ({ role: msg.role, content: msg.content })),
-      temperature: settings.Temp,
-      top_p: settings.TopP,
       stream: false,
+      ...buildRequestDefaults(modelProfile),
     };
     const url = `http://${settings.Host}:${settings.Port}/v1/chat/completions`;
     const controller = new AbortController();

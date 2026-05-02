@@ -13,7 +13,7 @@ Electron is the only supported application path. Legacy Python, Tkinter, and Pow
 - `src/main/index.ts` boots Electron, creates services, registers IPC, and opens the main window.
 - `src/main/createWindow.ts` configures the browser window and preload script.
 - `src/main/AppPaths.ts` centralizes project, asset, and user-data paths.
-- `src/main/SettingsService.ts` loads, saves, and resets `llama-server` settings.
+- `src/main/SettingsService.ts` loads, saves, and resets server settings plus per-model profile overrides.
 - `src/main/ModelService.ts` loads presets, registry entries, GGUF files, and model config metadata.
 - `src/main/LauncherService.ts` owns `llama-server.exe` path persistence plus process start/stop state.
 - `src/main/ChatService.ts` calls the OpenAI-compatible local chat API and persists sessions.
@@ -28,9 +28,9 @@ Electron is the only supported application path. Legacy Python, Tkinter, and Pow
 ### Shared domain
 
 - `src/shared/types.ts` defines app, model, preset, metrics, chat, and settings types.
-- `src/shared/defaults.ts` defines default `llama-server` settings and presets.
+- `src/shared/defaults.ts` defines default server settings, model profile defaults, inference defaults, and presets.
 - `src/shared/parsers.ts` parses model registry/config formats.
-- `src/shared/commandBuilder.ts` centralizes `llama-server` command argument generation.
+- `src/shared/commandBuilder.ts` centralizes structured `llama-server` argument and request-default generation.
 - `src/shared/ipc.ts` defines IPC channel names and API contracts.
 
 ### Renderer
@@ -58,6 +58,12 @@ User runtime state is stored in Electron's user-data directory through `AppPaths
 - `launcher.json`
 - `chat-sessions.json`
 
+## Configuration ownership
+
+- Settings tab owns `ServerSettings`: executable path, host, port, API key, metrics/logging, process strategy, health/startup behavior, and multi-model repository mode.
+- Deploy right panel owns `ModelProfileConfig`: selected-model identity, load/runtime options, prompt/template overrides, inference defaults, sampling, and reasoning defaults.
+- `LauncherSnapshot` / `RuntimeDeploymentState` describe live runtime state and are not persisted as user config.
+
 ## Command generation
 
 All `llama-server` CLI flags should be added in one place:
@@ -66,10 +72,10 @@ All `llama-server` CLI flags should be added in one place:
 
 To add a new setting:
 
-1. add the field/type in `src/shared/types.ts`
+1. add the field/type in `src/shared/types.ts` under the correct owner (`ServerSettings`, `ModelProfileConfig`, or request defaults)
 2. add its default in `src/shared/defaults.ts`
-3. map it to CLI arguments in `src/shared/commandBuilder.ts`
-4. expose or edit it in `src/renderer/views/settings.ts` or the relevant deploy settings panel
+3. map server startup args, model-load args, or request defaults in `src/shared/commandBuilder.ts`
+4. expose server-global fields only in `src/renderer/views/settings.ts`; expose selected-model fields only in the Deploy right panel
 5. keep IPC payloads typed through `src/shared/ipc.ts`
 
 ## UI architecture

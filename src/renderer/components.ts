@@ -33,9 +33,38 @@ export function metricTile(label: string, value: string, detail?: string): HTMLE
   return node;
 }
 
-export function input(label: string, value: string, onInput: (value: string) => void, type = 'text'): HTMLElement {
+export interface FieldOptions {
+  tooltip?: string;
+  suggestions?: string[];
+}
+
+function appendFieldLabel(wrap: HTMLElement, label: string, tooltip?: string): void {
+  const labelNode = el('span', 'field-label', label);
+  if (tooltip) {
+    labelNode.title = tooltip;
+    labelNode.append(el('span', 'field-help', ' ?'));
+  }
+  wrap.append(labelNode);
+  if (tooltip) wrap.title = tooltip;
+}
+
+function attachDatalist(node: HTMLInputElement, label: string, suggestions?: string[]): void {
+  if (!suggestions?.length) return;
+  const listId = `list-${label.replace(/[^a-z0-9_-]+/gi, '-')}`;
+  const list = document.createElement('datalist');
+  list.id = listId;
+  suggestions.forEach((value) => {
+    const option = document.createElement('option');
+    option.value = value;
+    list.append(option);
+  });
+  node.setAttribute('list', listId);
+  node.after(list);
+}
+
+export function input(label: string, value: string, onInput: (value: string) => void, type = 'text', options: FieldOptions = {}): HTMLElement {
   const wrap = el('label', 'field');
-  wrap.append(el('span', 'field-label', label));
+  appendFieldLabel(wrap, label, options.tooltip);
   const node = document.createElement('input');
   node.type = type;
   node.className = 'field-input';
@@ -43,12 +72,13 @@ export function input(label: string, value: string, onInput: (value: string) => 
   node.value = value;
   node.addEventListener('input', () => onInput(node.value));
   wrap.append(node);
+  attachDatalist(node, label, options.suggestions);
   return wrap;
 }
 
-export function textarea(label: string, value: string, onInput: (value: string) => void, rows = 4): HTMLElement {
+export function textarea(label: string, value: string, onInput: (value: string) => void, rows = 4, options: FieldOptions = {}): HTMLElement {
   const wrap = el('label', 'field');
-  wrap.append(el('span', 'field-label', label));
+  appendFieldLabel(wrap, label, options.tooltip);
   const node = document.createElement('textarea');
   node.className = 'field-input textarea';
   node.dataset.focusKey = `textarea:${label}`;
@@ -59,9 +89,9 @@ export function textarea(label: string, value: string, onInput: (value: string) 
   return wrap;
 }
 
-export function select(label: string, value: string, options: Array<{ value: string; label: string }>, onChange: (value: string) => void): HTMLElement {
+export function select(label: string, value: string, options: Array<{ value: string; label: string }>, onChange: (value: string) => void, fieldOptions: FieldOptions = {}): HTMLElement {
   const wrap = el('label', 'field');
-  wrap.append(el('span', 'field-label', label));
+  appendFieldLabel(wrap, label, fieldOptions.tooltip);
   const node = document.createElement('select');
   node.className = 'field-input';
   node.dataset.focusKey = `select:${label}`;
@@ -80,16 +110,34 @@ export function select(label: string, value: string, options: Array<{ value: str
 export function tree(root: TreeNode[], onSelect: (id: string) => void, activeId?: string): HTMLElement {
   const wrap = el('div', 'tree');
   const renderNode = (node: TreeNode, depth: number): HTMLElement => {
-    const row = el('button', `tree-row ${node.kind} ${node.modelId === activeId ? 'active' : ''}`.trim(), `${' '.repeat(depth * 2)}${node.label}`) as HTMLButtonElement;
-    row.type = 'button';
-    if (node.kind === 'model' && node.modelId) row.addEventListener('click', () => onSelect(node.modelId!));
-    if (node.children?.length) {
-      const group = el('div', 'tree-group');
-      group.append(row);
-      node.children.forEach((child) => group.append(renderNode(child, depth + 1)));
-      return group;
+    const icon = node.kind === 'group' ? '▾' : '◦';
+    const rowClass = `tree-row ${node.kind} ${node.modelId === activeId ? 'active' : ''}`.trim();
+    const content = el('div', 'tree-node-content');
+    content.append(el('div', 'tree-node-icon', icon), el('div', 'tree-node-text'));
+    const text = content.querySelector('.tree-node-text') as HTMLElement;
+    text.append(el('div', 'tree-row-title tree-node-title', node.label));
+    if (node.detail) text.append(el('div', 'tree-row-detail tree-node-detail', node.detail));
+
+    if (node.kind === 'model') {
+      const row = el('button', rowClass) as HTMLButtonElement;
+      row.type = 'button';
+      if (node.modelId) row.dataset.modelId = node.modelId;
+      row.draggable = false;
+      row.append(content);
+      if (node.modelId) row.addEventListener('click', () => onSelect(node.modelId!));
+      return row;
     }
-    return row;
+
+    const branch = el('div', 'tree-branch');
+    const groupRow = el('div', rowClass);
+    groupRow.append(content);
+    branch.append(groupRow);
+    if (node.children?.length) {
+      const children = el('div', 'tree-children');
+      node.children.forEach((child) => children.append(renderNode(child, depth + 1)));
+      branch.append(children);
+    }
+    return branch;
   };
   root.forEach((node) => wrap.append(renderNode(node, 0)));
   return wrap;

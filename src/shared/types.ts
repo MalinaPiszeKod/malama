@@ -1,12 +1,56 @@
 export type ViewName = 'deploy' | 'library' | 'chat' | 'settings' | 'metrics';
 
-export interface LlamaServerSettings {
-  GpuLayers: number;
-  NcpuMoe: number;
-  CtxSize: number;
+export interface ServerSettings {
+  Host: string;
+  Port: number;
+  ApiKey: string;
+  Webui: boolean;
+  Metrics: boolean;
+  ContBatching: boolean;
   Threads: number;
   BatchSize: number;
   UBatchSize: number;
+  Parallel: number;
+  MultiModel: boolean;
+  ModelsDir: string;
+  ModelsMax: number;
+  ModelsAutoload: boolean;
+  DefaultWorkingDirectory: string;
+  HealthCheckTimeoutMs: number;
+  StartupBehavior: 'manual' | 'launch-selected-on-open';
+  ProcessStrategy: 'single-server-process' | 'multiple-managed-processes';
+  LogVerbosity: string;
+}
+
+export interface ModelLoadSettings {
+  Alias: string;
+  CtxSize: number;
+  GpuLayers: number;
+  NcpuMoe: number;
+  CacheTypeK: string;
+  CacheTypeV: string;
+  FlashAttn: string;
+  SplitMode: string;
+  TensorSplit: string;
+  MainGpu: number;
+  Device: string;
+  Mlock: boolean;
+  NoMmap: boolean;
+  Jinja: boolean;
+  ChatTemplate: string;
+  SystemPrompt: string;
+  RopeScaling: string;
+  RopeFreqBase: string;
+  RopeFreqScale: string;
+}
+
+export interface InferenceDefaults {
+  MaxTokens: number;
+  Thinking: boolean;
+  PreserveThinking: boolean;
+  ReasoningFormat: string;
+  ReasoningBudget: string;
+  StopSequences: string;
   Temp: number;
   TopP: number;
   TopK: number;
@@ -16,36 +60,41 @@ export interface LlamaServerSettings {
   RepeatLastN: number;
   PresencePenalty: number;
   FreqPenalty: number;
-  CacheTypeK: string;
-  CacheTypeV: string;
-  FlashAttn: boolean;
-  SplitMode: string;
-  TensorSplit: number;
-  Mlock: boolean;
-  NoMmap: boolean;
-  Host: string;
-  Port: number;
-  Parallel: number;
-  ApiKey: string;
-  Alias: string;
-  MultiModel: boolean;
-  ModelsDir: string;
-  ModelsMax: number;
-  ModelsAutoload: boolean;
-  Thinking: boolean;
-  PreserveThinking: boolean;
-  ReasoningFormat: string;
-  ReasoningBudget: string;
-  Jinja: boolean;
-  Webui: boolean;
-  Metrics: boolean;
-  ContBatching: boolean;
   DryMultiplier: number;
   DryBase: number;
   DryAllowed: number;
   XtcProb: number;
   XtcThresh: number;
   Seed: number;
+}
+
+export interface ModelProfileConfig extends ModelLoadSettings, InferenceDefaults {}
+
+export type LlamaServerSettings = ServerSettings & ModelProfileConfig;
+
+export type DeploymentMode = 'single-model-process' | 'multi-model-repository' | 'multiple-managed-processes';
+
+export interface DeploymentConfig {
+  mode: DeploymentMode;
+  modelPath?: string;
+  modelsDir?: string;
+  alias?: string;
+}
+
+export interface ModelDeploymentState {
+  modelId?: string;
+  modelName?: string;
+  alias?: string;
+  endpoint?: string;
+  status: 'starting' | 'running' | 'unavailable' | 'error';
+  error?: string;
+}
+
+export interface RuntimeDeploymentState {
+  mode: DeploymentMode;
+  deployments: ModelDeploymentState[];
+  health: 'unknown' | 'ready' | 'unreachable';
+  error?: string;
 }
 
 export interface PresetDefinition {
@@ -64,6 +113,11 @@ export interface ModelRegistryEntry {
 
 export interface ModelMetadata {
   description: string;
+  repository: string;
+  baseModelRepository?: string;
+  baseModelRepositoryUrl?: string;
+  family: string;
+  tags: string[];
   systemPrompt: string;
   chatTemplate: string;
   host?: string;
@@ -91,7 +145,7 @@ export interface ModelInfo {
   quant: string;
   sizeGb: number;
   metadata: ModelMetadata;
-  configSettings: Partial<LlamaServerSettings>;
+  configSettings: Partial<ModelProfileConfig>;
   registrySource: ModelRegistryEntry['source'];
   estimate: DeploymentEstimate;
 }
@@ -99,6 +153,7 @@ export interface ModelInfo {
 export interface TreeNode {
   id: string;
   label: string;
+  detail?: string;
   kind: 'group' | 'model';
   children?: TreeNode[];
   modelId?: string;
@@ -115,6 +170,7 @@ export interface ModelCatalog {
 export interface RunningModelSnapshot {
   pid: number;
   redactedCommandText: string;
+  redactedArgs: string[];
   cwd: string;
   startedAt: number;
   stdoutTail: string[];
@@ -126,8 +182,24 @@ export interface LauncherSnapshot {
   modelName?: string;
   host?: string;
   port?: number;
+  apiKeyConfigured?: boolean;
   executablePath?: string;
+  mode?: DeploymentMode;
+  deployment?: RuntimeDeploymentState;
   process?: RunningModelSnapshot;
+  error?: string;
+}
+
+export interface CloudflaredTunnelSnapshot {
+  installed: boolean;
+  installing: boolean;
+  running: boolean;
+  executablePath?: string;
+  targetUrl?: string;
+  publicUrl?: string;
+  pid?: number;
+  startedAt?: number;
+  stdoutTail: string[];
   error?: string;
 }
 
@@ -186,14 +258,24 @@ export interface HuggingFaceModelSummary {
   lastModified?: string;
 }
 
+export interface HuggingFaceSearchRequest {
+  query: string;
+  tag?: string;
+  pipeline?: string;
+  sort?: 'downloads' | 'likes' | 'lastModified' | 'modelId';
+  limit?: number;
+}
+
 export interface BootstrapPayload {
-  settings: LlamaServerSettings;
+  settings: ServerSettings;
+  modelProfiles: Record<string, Partial<ModelProfileConfig>>;
   presets: PresetDefinition[];
   catalog: ModelCatalog;
   metrics: MetricSnapshot;
   chatSessions: ChatSession[];
   huggingFace: HuggingFaceModelSummary[];
   launcher: LauncherSnapshot;
+  cloudflared: CloudflaredTunnelSnapshot;
 }
 
 export interface AppPathsState {
@@ -204,6 +286,7 @@ export interface AppPathsState {
   settingsFile: string;
   chatSessionsFile: string;
   launcherFile: string;
+  toolsDir: string;
   assetsDir: string;
   registryFile: string;
   presetsDir: string;

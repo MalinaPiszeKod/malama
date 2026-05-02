@@ -16,6 +16,7 @@ export class AppPaths {
       settingsFile: path.join(userDataDir, 'settings.json'),
       chatSessionsFile: path.join(userDataDir, 'chat-sessions.json'),
       launcherFile: path.join(userDataDir, 'launcher.json'),
+      toolsDir: path.join(userDataDir, 'tools'),
       assetsDir: path.join(rootDir, 'resources'),
       registryFile: path.join(rootDir, 'models.registry'),
       presetsDir: path.join(rootDir, 'presets'),

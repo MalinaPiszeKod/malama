@@ -47,7 +47,7 @@ export function renderChatView(state: AppState, actions: AppActions): HTMLElemen
   footer.append(
     badge(`Model: ${state.launcher.modelName || 'idle'}`),
     badge(`Tokens: ${session?.messages.length || 0}`),
-    badge(`Endpoint: ${state.settings.Host}:${state.settings.Port}`)
+    badge(`Endpoint: ${state.launcher.host ?? state.settingsDraft.Host}:${state.launcher.port ?? state.settingsDraft.Port}`)
   );
   composer.append(editor, send);
 

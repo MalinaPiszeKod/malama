@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { DeploymentEstimate, LlamaServerSettings, ModelInfo, ModelMetadata, ModelRegistryEntry, PresetDefinition } from './types';
-import { DEFAULT_SETTINGS } from './defaults';
+import type { DeploymentEstimate, LlamaServerSettings, ModelInfo, ModelMetadata, ModelProfileConfig, ModelRegistryEntry, PresetDefinition } from './types';
+import { DEFAULT_MODEL_PROFILE_CONFIG } from './defaults.js';
 
 export function parseKeyValueText(text: string): Record<string, string> {
   return text.split(/\r?\n/).reduce<Record<string, string>>((acc, rawLine) => {
@@ -43,11 +43,14 @@ export function parsePreset(filePath: string, text: string): PresetDefinition | 
   }
 }
 
-export function parseModelConfig(filePath: string, text: string): { alias: string; modelPath: string; metadata: ModelMetadata; settings: Partial<LlamaServerSettings> } {
+export function parseModelConfig(filePath: string, text: string): { alias: string; modelPath: string; metadata: ModelMetadata; settings: Partial<ModelProfileConfig> } {
   const kv = parseKeyValueText(text);
   const settings: any = {};
   const metadata: ModelMetadata = {
-    description: '',
+    description: kv.DESCRIPTION ?? kv.MODEL_DESCRIPTION ?? '',
+    repository: kv.REPOSITORY ?? kv.HF_REPO ?? kv.HUGGINGFACE_REPO ?? kv.MODEL_REPO ?? kv.REPO ?? '',
+    family: '',
+    tags: [],
     systemPrompt: kv.CHAT_SYS_PROMPT ?? '',
     chatTemplate: kv.CHAT_TEMPLATE ?? '',
     ...(kv.HOST ? { host: kv.HOST } : {}),
@@ -59,15 +62,14 @@ export function parseModelConfig(filePath: string, text: string): { alias: strin
     extra: {},
   };
 
-  const mapping: Record<string, keyof LlamaServerSettings> = {
+  const mapping: Record<string, keyof ModelProfileConfig> = {
     N_GPU_LAYERS: 'GpuLayers',
     GPU_LAYERS: 'GpuLayers',
-    THREADS: 'Threads',
     CPU_MOE: 'NcpuMoe',
     N_CPU_MOE: 'NcpuMoe',
-    BATCH_SIZE: 'BatchSize',
-    UBATCH_SIZE: 'UBatchSize',
     CTX_SIZE: 'CtxSize',
+    MAX_TOKENS: 'MaxTokens',
+    N_PREDICT: 'MaxTokens',
     TEMPERATURE: 'Temp',
     TEMP: 'Temp',
     TOP_P: 'TopP',
@@ -84,43 +86,33 @@ export function parseModelConfig(filePath: string, text: string): { alias: strin
     FLASH_ATTN: 'FlashAttn',
     SPLIT_MODE: 'SplitMode',
     TENSOR_SPLIT: 'TensorSplit',
-    HOST: 'Host',
-    PORT: 'Port',
-    PARALLEL: 'Parallel',
+    MAIN_GPU: 'MainGpu',
+    DEVICE: 'Device',
     THINKING: 'Thinking',
     PRESERVE_THINKING: 'PreserveThinking',
     REASONING_FORMAT: 'ReasoningFormat',
     REASONING_BUDGET: 'ReasoningBudget',
     JINJA: 'Jinja',
-    WEBUI: 'Webui',
-    METRICS: 'Metrics',
-    CONT_BATCHING: 'ContBatching',
+    CHAT_TEMPLATE: 'ChatTemplate',
+    CHAT_SYS_PROMPT: 'SystemPrompt',
+    STOP_SEQUENCES: 'StopSequences',
     DRY_MULTIPLIER: 'DryMultiplier',
     DRY_BASE: 'DryBase',
     DRY_ALLOWED: 'DryAllowed',
     XTC_PROB: 'XtcProb',
     XTC_THRESH: 'XtcThresh',
     SEED: 'Seed',
-    API_KEY: 'ApiKey',
     ALIAS: 'Alias',
-    MODELS_DIR: 'ModelsDir',
-    MODELS_MAX: 'ModelsMax',
-    MODELS_AUTOLOAD: 'ModelsAutoload',
-    MULTI_MODEL: 'MultiModel',
     MLOCK: 'Mlock',
     NO_MMAP: 'NoMmap',
   };
 
   Object.entries(kv).forEach(([key, value]) => {
-    if (key === 'MODEL_PATH') {
+    if (['MODEL_PATH', 'DESCRIPTION', 'MODEL_DESCRIPTION', 'REPOSITORY', 'HF_REPO', 'HUGGINGFACE_REPO', 'MODEL_REPO', 'REPO', 'FAMILY', 'MODEL_FAMILY', 'TAGS', 'MODEL_TAGS'].includes(key)) {
       return;
     }
     if (key === 'ALIAS') {
       settings.Alias = value;
-      return;
-    }
-    if (key === 'NO_WEBUI') {
-      settings.Webui = !['on', 'true', '1', 'yes'].includes(value.toLowerCase());
       return;
     }
     if (key === 'CPU_MOE') {
@@ -129,10 +121,10 @@ export function parseModelConfig(filePath: string, text: string): { alias: strin
     }
     if (key in mapping) {
       const mapped = mapping[key as keyof typeof mapping];
-      if (mapped && typeof DEFAULT_SETTINGS[mapped] === 'boolean') {
+      if (mapped && typeof DEFAULT_MODEL_PROFILE_CONFIG[mapped] === 'boolean') {
         settings[mapped] = ['on', 'true', '1', 'yes'].includes(value.toLowerCase());
-      } else if (mapped && typeof DEFAULT_SETTINGS[mapped] === 'number') {
-        settings[mapped] = Number.isFinite(Number(value)) ? Number(value) : DEFAULT_SETTINGS[mapped];
+      } else if (mapped && typeof DEFAULT_MODEL_PROFILE_CONFIG[mapped] === 'number') {
+        settings[mapped] = Number.isFinite(Number(value)) ? Number(value) : DEFAULT_MODEL_PROFILE_CONFIG[mapped];
       } else if (mapped) {
         settings[mapped] = value;
       }

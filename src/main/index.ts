@@ -7,9 +7,10 @@ import { LauncherService } from './LauncherService';
 import { MetricsService } from './MetricsService';
 import { ChatService } from './ChatService';
 import { HuggingFaceService } from './HuggingFaceService';
+import { CloudflaredService } from './CloudflaredService';
 import { registerIpc } from './ipc';
 import { createMainWindow } from './createWindow';
-import { DEFAULT_SETTINGS } from '../shared/defaults';
+import { DEFAULT_SERVER_SETTINGS } from '../shared/defaults';
 
 async function bootstrap() {
   app.setName("malama - Malina's Llama Launcher");
@@ -18,11 +19,13 @@ async function bootstrap() {
   const paths = new AppPaths(app);
   const store = new JsonStore();
   const settings = new SettingsService(paths, store);
-  const models = new ModelService(paths);
   const launcher = new LauncherService(paths, store);
   const metrics = new MetricsService();
   const chat = new ChatService(paths, store);
   const huggingFace = new HuggingFaceService();
+  const models = new ModelService(paths, huggingFace);
+  const cloudflared = new CloudflaredService(paths);
+  let cloudflaredStoppedForQuit = false;
 
   registerIpc({
     paths,
@@ -32,18 +35,22 @@ async function bootstrap() {
     metrics,
     chat,
     huggingFace,
+    cloudflared,
     async bootstrap() {
       const currentSettings = await settings.load();
-      const catalog = await models.refreshCatalog(await settings.loadOverrides());
+      const modelProfiles = await settings.loadModelProfiles();
+      const catalog = await models.refreshCatalog();
       const launcherState = launcher.snapshot;
       return {
-        settings: currentSettings || DEFAULT_SETTINGS,
+        settings: currentSettings || DEFAULT_SERVER_SETTINGS,
+        modelProfiles,
         presets: await models.loadPresets(),
         catalog,
         metrics: await metrics.collect(launcherState),
         chatSessions: await chat.loadSessions(),
         huggingFace: await huggingFace.search('gguf'),
         launcher: launcherState,
+        cloudflared: await cloudflared.getStatus(),
       };
     },
   });
@@ -58,6 +65,19 @@ async function bootstrap() {
 
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit();
+  });
+
+  app.on('before-quit', (event) => {
+    if (cloudflaredStoppedForQuit || !cloudflared.snapshot.running) return;
+    event.preventDefault();
+    void cloudflared.stop().then((status) => {
+      if (status.running) {
+        console.error(status.error || 'Cloudflared tunnel is still running; canceling quit to avoid orphaning a public tunnel.');
+        return;
+      }
+      cloudflaredStoppedForQuit = true;
+      app.quit();
+    });
   });
 }
 

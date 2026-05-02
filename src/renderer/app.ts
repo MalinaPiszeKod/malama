@@ -13,13 +13,31 @@ export function renderApp(state: AppState, actions: AppActions): HTMLElement {
   const logo = document.createElement('img');
   logo.className = 'app-logo';
   logo.src = '../resources/images/logo.png';
-  logo.alt = 'malama';
-  logoWrap.append(logo, el('div', 'brand-text', "malama - Malina's Llama Launcher"));
+  logo.alt = 'Malina logo';
+  logoWrap.append(logo, el('div', 'brand-text', "Malina's Llama Launcher"));
   const nav = el('nav', 'nav-tabs');
   ([['deploy', 'Deploy'], ['library', 'Library'], ['chat', 'Chat'], ['settings', 'Settings'], ['metrics', 'Metrics']] as const).forEach(([id, label]) => {
     nav.append(button(label, () => actions.setView(id), `nav ${state.view === id ? 'active' : ''}`));
   });
-  topbar.append(logoWrap, nav);
+  const serverHost = state.launcher.host ?? state.settingsDraft.Host;
+  const serverPort = state.launcher.port ?? state.settingsDraft.Port;
+  const serverUrl = `http://${serverHost}:${serverPort}`;
+  const serverControls = el('div', 'topbar-server');
+  serverControls.append(
+    el('div', `topbar-server-meta ${state.launcher.running ? 'running' : 'stopped'}`, state.launcher.running ? 'Server running' : 'Server stopped'),
+    el('div', 'topbar-server-url', serverUrl),
+    el('div', 'button-row topbar-buttons')
+  );
+  const buttonRow = serverControls.querySelector('.button-row') as HTMLElement;
+  buttonRow.append(
+    button('Launch', actions.launchSelected, 'primary'),
+    button('Stop', actions.stopLaunch, 'danger'),
+    button('Copy URL', actions.copyServerUrl, 'secondary')
+  );
+  (buttonRow.children[0] as HTMLButtonElement).disabled = (!state.selectedModelId && !state.settingsDraft.MultiModel) || state.launcher.running;
+  (buttonRow.children[1] as HTMLButtonElement).disabled = !state.launcher.running;
+  (buttonRow.children[2] as HTMLButtonElement).disabled = !serverUrl;
+  topbar.append(logoWrap, nav, serverControls);
 
   const content = el('section', 'content');
   switch (state.view) {

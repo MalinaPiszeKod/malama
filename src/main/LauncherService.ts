@@ -2,9 +2,9 @@ import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import type { LlamaServerSettings, LauncherSnapshot, ModelInfo, RunningModelSnapshot } from '../shared/types';
-import { argsToList, buildCommandArgs, commandString } from '../shared/commandBuilder';
-import { normalizeSettings } from '../shared/defaults';
+import type { LauncherSnapshot, ModelInfo, ModelProfileConfig, RunningModelSnapshot, RuntimeDeploymentState, ServerSettings } from '../shared/types';
+import { buildLaunchPlan } from '../shared/commandBuilder';
+import { normalizeModelProfileConfig, normalizeServerSettings } from '../shared/defaults';
 import { JsonStore } from './JsonStore';
 import type { AppPaths } from './AppPaths';
 
@@ -20,6 +20,8 @@ export class LauncherService {
     modelName?: string;
     host: string;
     port: number;
+    apiKeyConfigured: boolean;
+    deployment: RuntimeDeploymentState;
   };
   private executablePath: string;
   private lastError?: string;
@@ -64,44 +66,46 @@ export class LauncherService {
       modelName: this.running.modelName,
       host: this.running.host,
       port: this.running.port,
+      apiKeyConfigured: this.running.apiKeyConfigured,
       executablePath: this.executablePath,
+      mode: this.running.deployment.mode,
+      deployment: this.running.deployment,
       process: this.running.snapshot,
       ...(this.lastError ? { error: this.lastError } : {}),
     };
   }
 
-  async start(model: ModelInfo | null, settings: Partial<LlamaServerSettings>): Promise<LauncherSnapshot> {
+  async start(model: ModelInfo | null, serverSettings: Partial<ServerSettings>, modelProfile: Partial<ModelProfileConfig> = {}): Promise<LauncherSnapshot> {
     if (this.running || this.launching) {
       this.lastError = 'Stop the running model before launching another.';
       return this.snapshot;
     }
     this.launching = true;
     let executablePath: string;
-    let effectiveSettings: LlamaServerSettings;
+    let effectiveServer: ServerSettings;
+    let effectiveProfile: ModelProfileConfig;
     let cwd: string;
     try {
       await this.initialize();
       executablePath = this.executablePath;
-      effectiveSettings = normalizeSettings({ ...(model?.configSettings ?? {}), ...settings });
-      cwd = model?.directory || path.dirname(executablePath);
+      effectiveServer = normalizeServerSettings(serverSettings);
+      effectiveProfile = normalizeModelProfileConfig({ ...(model?.configSettings ?? {}), ...modelProfile });
+      cwd = effectiveServer.DefaultWorkingDirectory.trim() || model?.directory || path.dirname(executablePath);
       if (path.basename(executablePath).toLowerCase() !== 'llama-server.exe') throw new Error('Executable must be llama-server.exe');
       await fs.access(executablePath);
       await fs.access(cwd);
-      if (model?.path && !effectiveSettings.MultiModel) await fs.access(model.path);
+      if (model?.path && !effectiveServer.MultiModel) await fs.access(model.path);
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : 'Unable to access executable, model, or working directory.';
       this.launching = false;
       return this.snapshot;
     }
 
-    let args;
-    let redactedArgs;
+    let plan;
     let child: ChildProcess;
     try {
-      args = buildCommandArgs(model?.path, effectiveSettings);
-      redactedArgs = { ...args };
-      if ('api-key' in redactedArgs && redactedArgs['api-key']) redactedArgs['api-key'] = '***';
-      child = spawn(executablePath, argsToList(args), {
+      plan = buildLaunchPlan(executablePath, model?.path, effectiveServer, effectiveProfile);
+      child = spawn(executablePath, plan.argv, {
         cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
@@ -114,18 +118,32 @@ export class LauncherService {
     }
     const snapshot: RunningModelSnapshot = {
       pid: child.pid ?? 0,
-      redactedCommandText: commandString(executablePath, redactedArgs),
+      redactedCommandText: plan.redactedCommandText,
+      redactedArgs: plan.redactedArgv,
       cwd,
       startedAt: Date.now(),
       stdoutTail: [],
+    };
+    const deployment: RuntimeDeploymentState = {
+      mode: plan.deployment.mode,
+      health: 'unknown',
+      deployments: effectiveServer.MultiModel ? [] : [{
+        ...(model?.id ? { modelId: model.id } : {}),
+        ...(model?.name ? { modelName: model.name } : {}),
+        ...(effectiveProfile.Alias ? { alias: effectiveProfile.Alias } : {}),
+        endpoint: `http://${effectiveServer.Host}:${effectiveServer.Port}`,
+        status: 'starting',
+      }],
     };
     this.running = {
       process: child,
       snapshot,
       ...(model?.id ? { modelId: model.id } : {}),
       ...(model?.name ? { modelName: model.name } : {}),
-      host: effectiveSettings.Host,
-      port: effectiveSettings.Port,
+      host: effectiveServer.Host,
+      port: effectiveServer.Port,
+      apiKeyConfigured: Boolean(effectiveServer.ApiKey.trim()),
+      deployment,
     };
     this.launching = false;
     this.lastError = undefined;
